@@ -120,8 +120,16 @@ const DONUTSMP_STRICT_VERSION = "1.21.11";
 
 // ============================================================
 // FRESHSMP SETTINGS
+// play.freshsmp.fun added alongside existing patterns
 // ============================================================
-const FRESHSMP_HOST_PATTERNS = ["freshsmp.net", "freshsmp", "elementalmc.live", "play.elementalmc.live"];
+const FRESHSMP_HOST_PATTERNS = [
+  "freshsmp.fun",
+  "play.freshsmp.fun",
+  "freshsmp.net",
+  "freshsmp",
+  "elementalmc.live",
+  "play.elementalmc.live",
+];
 const FRESHSMP_STRICT_VERSION = "1.21.11";
 // Delay (ms) after spawn before sending /queue — gives the server time
 // to finish loading the player in before accepting commands.
@@ -290,6 +298,18 @@ function makeBotId(discordId, minecraftUser) {
   return `${discordId}:${minecraftUser.toLowerCase()}`;
 }
 
+/**
+ * Send client_settings (brand/locale) to the server.
+ *
+ * IMPORTANT: For Paper-based servers (FreshSMP, ElementalMC, etc.) this
+ * MUST be called immediately upon the "login" event — before any tick or
+ * delay — otherwise the server closes the connection with socketClosed
+ * because it expects settings within the first few packets.
+ *
+ * We still schedule a second send after 1s as a fallback in case the
+ * immediate send races against the client setup, but the immediate send
+ * is what actually prevents the disconnect.
+ */
 function sendClientSettings(bot, username, context) {
   const ctx = context || "unknown";
   console.log(`[botmanager] 📋 [${username}] Sending client settings (context: ${ctx})`);
@@ -300,7 +320,7 @@ function sendClientSettings(bot, username, context) {
     });
     console.log(`[botmanager] 📋 [${username}] Client settings sent successfully`);
   } catch (err) {
-    console.warn(`[botmanager] ⚠️ [${username}] Could not send client settings:`, err.message);
+    console.warn(`[botmanager] ⚠️ [${username}] Could not send client settings (${ctx}):`, err.message);
   }
 }
 
@@ -353,9 +373,6 @@ function installDonutSmpMovementBlock(bot, entry, botId, minecraftUser) {
 
 // ============================================================
 // FRESHSMP: Send gamemode queue command
-//
-// Called either immediately after spawn (if gamemode was
-// pre-selected) or after the Discord user picks one via DM button.
 // ============================================================
 function sendFreshSmpQueueCommand(botId, gamemode) {
   const entry = activeBots.get(botId);
@@ -405,10 +422,6 @@ function sendFreshSmpQueueCommand(botId, gamemode) {
 
 // ============================================================
 // FRESHSMP: Wait for gamemode selection
-//
-// Returns a Promise that resolves with the chosen queueArg
-// (e.g. "survival") when the Discord user clicks a button,
-// or rejects after FRESHSMP_GAMEMODE_TIMEOUT_MS.
 // ============================================================
 function waitForFreshSmpGamemode(botId) {
   return new Promise((resolve, reject) => {
@@ -489,7 +502,7 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
   let isEating = false;
   let eatCooldownUntil = 0;
 
-  const initialSpawnTimeoutMs = isDonutSmp ? 90000 : 30000;
+  const initialSpawnTimeoutMs = isDonutSmp ? 90000 : 60000;
 
   entry.spawnTimeoutId = setTimeout(() => {
     if (!activeBots.has(botId)) return;
@@ -499,7 +512,7 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     console.warn(`[botmanager] ⏰ Spawn timeout for ${minecraftUser} after ${Math.round(initialSpawnTimeoutMs / 1000)}s (${e.donutSmpVerificationRetries} retries) — giving up`);
     e.spawnError = isDonutSmp
       ? "DonutSMP security check timed out. Please confirm the login via the DonutSMP Discord bot DM, then try /mcbot start again."
-      : "Bot failed to connect within 30 seconds. The server may be offline or unreachable.";
+      : "Bot failed to connect within 60 seconds. The server may be offline or unreachable.";
     e.status = "error";
     if (isDonutSmp) e.errorCategory = "donutsmp_verification";
     cleanupBot(botId, "spawn_timeout");
@@ -576,21 +589,32 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
         installDonutSmpMovementBlock(bot, e, botId, minecraftUser);
         console.log(`[botmanager] 🟠 DonutSMP login — movement block + ping/pong active. Monitoring for verification disconnect (retry ${e.donutSmpVerificationRetries}/${DONUTSMP_MAX_VERIFICATION_RETRIES})`);
       } else if (isFreshSmp) {
-        // ping/pong for Paper-based servers
+        // ── FreshSMP: install ping/pong IMMEDIATELY on login ──────────────────
+        // Paper servers expect ping responses within a very tight window.
+        // Installing this handler first (before any setTimeout) ensures we
+        // never miss a ping that arrives in the first few hundred milliseconds.
         bot._client.on("ping", (packet) => {
           try { bot._client.write("pong", { id: packet.id }); } catch (_) {}
         });
 
+        // Send client_settings IMMEDIATELY — Paper-based servers (FreshSMP)
+        // will close the connection with socketClosed if settings are not
+        // received within the first few packets after login. Do NOT defer this.
+        sendClientSettings(bot, minecraftUser, "login-immediate");
+
+        // Also schedule a retry after 1s in case the immediate send raced
+        // against the client's internal setup and failed silently.
         setTimeout(() => {
           if (!activeBots.has(botId) || entry.bot !== bot) return;
-          sendClientSettings(bot, minecraftUser, "post-login");
+          sendClientSettings(bot, minecraftUser, "login-retry-1s");
         }, 1000);
 
         // Fire the onFreshSmpSpawned callback so the Discord bot can DM
-        // the gamemode selector. Then wait for the user's selection before
-        // sending /queue. This runs async so it doesn't block login handling.
+        // the gamemode selector. Run async so it doesn't block login handling.
         _handleFreshSmpGamemodeFlow(botId, minecraftUser, bot, onFreshSmpSpawned);
+
       } else {
+        // Generic Paper/vanilla server
         bot._client.on("ping", (packet) => {
           try { bot._client.write("pong", { id: packet.id }); } catch (_) {}
         });
