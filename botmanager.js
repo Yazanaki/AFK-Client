@@ -175,20 +175,22 @@ const MAX_BOTS = parseInt(process.env.MAX_BOTS || "0", 10); // 0 = unlimited
 // ============================================================
 // DONUTSMP VERIFICATION RECONNECT SETTINGS
 //
-// DonutSMP disconnects bots with "socketClosed" both BEFORE login
-// (connection-phase rejection) and shortly AFTER login (verification
-// screen). We now handle both cases with the same retry counter.
+// DonutSMP closes the connection at multiple points during its
+// security verification flow:
 //
-// Pre-login socketClosed: bot never fires `login`, connectedSince = null.
-// Post-login socketClosed: bot fired `login`, connectedSince is set,
-//   and secondsOnline < 30.
+//   1. EPIPE — server closes socket during handshake/login phase
+//              before our bot can even finish writing its first packets.
+//   2. socketClosed (pre-login)  — TCP closed before `login` fires.
+//   3. socketClosed (post-login) — TCP closed shortly after `login`
+//              fires (verification screen shown, bot not confirmed yet).
 //
-// Both cases are treated as verification-related and retried silently.
+// All three are treated as verification-related and retried silently
+// using the same counter.
 // ============================================================
 const DONUTSMP_HOST_PATTERNS = ["donutsmp.net", "donutsmp"];
-// How many total socketClosed retries before giving up (pre + post login combined)
+// How many total retries before giving up
 const DONUTSMP_MAX_VERIFICATION_RETRIES = 10;
-// Delay between retries — give DonutSMP time to process the verification state
+// Delay between retries — give DonutSMP time to process verification state
 const DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS = 10000; // 10 seconds
 
 function isDonutSmpHost(host) {
@@ -198,8 +200,18 @@ function isDonutSmpHost(host) {
 }
 
 /**
+ * Detect if an error code looks like a DonutSMP verification connection reset.
+ * EPIPE means the server closed the write end of the socket while our bot was
+ * still sending handshake/login packets — DonutSMP's security check cutting
+ * the connection early before login completes.
+ */
+function isDonutSmpEpipe(errCode) {
+  return errCode === "EPIPE";
+}
+
+/**
  * Detect if a disconnect reason looks like the DonutSMP verification screen
- * disconnect. Now handles both pre-login (connectedSince === null) and
+ * disconnect. Handles both pre-login (connectedSince === null) and
  * post-login (connectedSince set, secondsOnline < 30) cases.
  */
 function isDonutSmpVerificationDisconnect(reason, connectedSince) {
@@ -222,7 +234,7 @@ const VERSION_CACHE_PATH = path.join(__dirname, "version-cache.json");
 const versionCache = new Map();
 
 const SUPPORTED_VERSIONS = new Set([
-  "1.21.4", "1.21.3", "1.21.2", "1.21.1", "1.21",
+  "1.21.11", "1.21.4", "1.21.3", "1.21.2", "1.21.1", "1.21",
   "1.20.6", "1.20.5", "1.20.4", "1.20.3", "1.20.2", "1.20.1", "1.20",
   "1.19.4", "1.19.3", "1.19.2", "1.19.1", "1.19",
   "1.18.2", "1.18.1", "1.18",
@@ -295,7 +307,7 @@ const BOT_FOOD_ITEMS = new Set([
 
 function getAutoCandidatesForHost(hostLower) {
   return [
-    "1.21.4", "1.21.1", "1.21",
+    "1.21.11", "1.21.4", "1.21.1", "1.21",
     "1.20.6", "1.20.4", "1.20.1",
     "1.19.4", "1.19.2",
     "1.18.2", "1.17.1", "1.16.5",
@@ -501,6 +513,42 @@ function hardDestroyBot(bot) {
 }
 
 // ============================================================
+// DONUTSMP VERIFICATION RETRY HELPER
+//
+// Central place to schedule a DonutSMP verification retry so the
+// same logic isn't duplicated across the error and end handlers.
+// Returns true if a retry was scheduled, false if retries exhausted.
+// ============================================================
+function scheduleDonutSmpRetry(botId, entry, spawnBotFn, phase) {
+  if (entry.donutSmpVerificationRetries < DONUTSMP_MAX_VERIFICATION_RETRIES) {
+    entry.donutSmpVerificationRetries++;
+    console.log(
+      `[botmanager] 🟠 DonutSMP verification disconnect (${phase}) for ${entry.minecraftUser} ` +
+      `(attempt ${entry.donutSmpVerificationRetries}/${DONUTSMP_MAX_VERIFICATION_RETRIES}) — reconnecting in ${DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS}ms`
+    );
+    entry.status = "reconnecting";
+    entry.spawnError = null;
+    setTimeout(() => {
+      if (!activeBots.has(botId)) return;
+      spawnBotFn(entry.version);
+    }, DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS);
+    return true;
+  } else {
+    console.warn(
+      `[botmanager] 🟠 DonutSMP verification retries exhausted for ${entry.minecraftUser} — reporting error to user`
+    );
+    entry.status = "error";
+    entry.spawnError =
+      "DonutSMP is requiring account verification before allowing you to join. " +
+      "Please log into DonutSMP manually once to complete the verification process, " +
+      "then try /mcbot start again.";
+    entry.errorCategory = "donutsmp_verification";
+    cleanupBot(botId, "donutsmp_verification_failed");
+    return false;
+  }
+}
+
+// ============================================================
 // START BOT
 // ============================================================
 
@@ -532,12 +580,12 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
 
   const { host, port } = parseServerAddress(serverAddress);
   const hostLower = String(host || "").toLowerCase();
-  const requestedVersion = (version || "1.21.4").trim();
+  const requestedVersion = (version || "1.21.11").trim();
   const autoMode = requestedVersion.toLowerCase() === "auto";
   const autoCandidates = autoMode ? getAutoCandidatesForHost(hostLower) : [];
   const cached = autoMode ? versionCache.get(hostLower) : null;
   let effectiveVersion = autoMode
-    ? (cached || autoCandidates[0] || "1.21.4")
+    ? (cached || autoCandidates[0] || "1.21.11")
     : requestedVersion;
 
   let autoVersionIndex = autoMode
@@ -563,7 +611,7 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     deviceCodeEmitted: false,
     bot: null,
     // DonutSMP verification retry tracking
-    // Counts ALL socketClosed retries regardless of whether login fired
+    // Counts ALL retries regardless of whether login fired
     isDonutSmp,
     donutSmpVerificationRetries: 0,
     connectedSince: null, // set when login fires; null = pre-login
@@ -747,9 +795,20 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       const errCode = err.code;
       const errMessage = err.message || "";
 
+      // ── DonutSMP EPIPE — server closed socket during handshake ──────────
+      // EPIPE on a DonutSMP server means the security check rejected the
+      // connection at the TCP level before login completed. Treat it as a
+      // verification retry, not a fatal error.
+      if (isDonutSmp && isDonutSmpEpipe(errCode)) {
+        const phase = e.connectedSince === null ? "pre-login (EPIPE)" : "post-login (EPIPE)";
+        console.log(`[botmanager] 🟠 DonutSMP EPIPE for ${minecraftUser} — treating as verification disconnect`);
+        scheduleDonutSmpRetry(botId, e, spawnBot, phase);
+        return;
+      }
+
       console.error(`[botmanager] ❌ Bot error (${minecraftUser}):`, errMessage);
 
-      // ── Auth error dedup ───────────────────────────────────
+      // ── Auth error dedup ───────────────────────────────────────────────
       const isAuthError =
         errMessage.includes("invalid_grant") ||
         errMessage.includes("AADSTS") ||
@@ -779,7 +838,7 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
         return;
       }
 
-      // Suppress the keepalive timeout error if we're already cleaning up
+      // Suppress keepalive timeout if we're already in a non-active state
       // (e.g. bot was stopped but the socket hadn't fully closed yet)
       if (errMessage.includes("timed out") && e.status !== "online" && e.status !== "connecting") {
         console.warn(`[botmanager] 🔇 Suppressing stale keepalive timeout for ${minecraftUser} (status: ${e.status})`);
@@ -809,44 +868,18 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       // "reconnecting" means a retry is already scheduled — ignore.
       if (e.status !== "online" && e.status !== "connecting") return;
 
-      const reasonStr = String(reason || "").toLowerCase();
       console.log(`[botmanager] 🔌 Bot disconnected (${minecraftUser}): ${reason}`);
 
-      // ── DonutSMP verification screen handling ──────────────
+      // ── DonutSMP verification screen handling ──────────────────────────
       // Handles BOTH pre-login (connectedSince === null) and post-login
       // (connectedSince set, online < 30s) socketClosed disconnects.
       if (e.isDonutSmp && isDonutSmpVerificationDisconnect(reason, e.connectedSince)) {
-        if (e.donutSmpVerificationRetries < DONUTSMP_MAX_VERIFICATION_RETRIES) {
-          e.donutSmpVerificationRetries++;
-          const phase = e.connectedSince === null ? "pre-login" : "post-login";
-          console.log(
-            `[botmanager] 🟠 DonutSMP verification disconnect (${phase}) for ${minecraftUser} ` +
-            `(attempt ${e.donutSmpVerificationRetries}/${DONUTSMP_MAX_VERIFICATION_RETRIES}) — reconnecting in ${DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS}ms`
-          );
-          e.status = "reconnecting";
-          e.spawnError = null; // clear any stale error
-          setTimeout(() => {
-            if (!activeBots.has(botId)) return;
-            spawnBot(e.version);
-          }, DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS);
-          return;
-        } else {
-          // Exhausted retries — give up and report a helpful error
-          console.warn(
-            `[botmanager] 🟠 DonutSMP verification retries exhausted for ${minecraftUser} — reporting error to user`
-          );
-          e.status = "error";
-          e.spawnError =
-            "DonutSMP is requiring account verification before allowing you to join. " +
-            "Please log into DonutSMP manually once to complete the verification process, " +
-            "then try /mcbot start again.";
-          e.errorCategory = "donutsmp_verification";
-          cleanupBot(botId, "donutsmp_verification_failed");
-          return;
-        }
+        const phase = e.connectedSince === null ? "pre-login" : "post-login";
+        scheduleDonutSmpRetry(botId, e, spawnBot, phase);
+        return;
       }
 
-      // ── Standard disconnect handling ─────────────────────
+      // ── Standard disconnect handling ───────────────────────────────────
       e.status = "error";
       e.spawnError = `Disconnected: ${reason}`;
 
