@@ -92,19 +92,18 @@ const MAX_BOTS = parseInt(process.env.MAX_BOTS || "0", 10);
 // ============================================================
 // KEEP-ALIVE TIMEOUT SETTINGS
 //
-// Root cause of the ~1hr timeout kick:
-//   mineflayer's checkTimeoutInterval defaults to 30s, which races
-//   with DonutSMP's server-side 30s keep-alive timeout window.
-//   If there's any processing delay on either end, we lose the race
-//   and get kicked with "disconnect.timeout".
+// checkTimeoutInterval is the duration mineflayer waits WITHOUT
+// receiving a keep_alive packet before it declares a timeout and
+// kills the connection. It is NOT a polling interval.
 //
-// FIX: Set checkTimeoutInterval to 10s so mineflayer checks and
-//   responds to keep-alive packets well within the server's window.
-//   Also explicitly handle the `ping` packet (a separate mechanism
-//   from `keep_alive` that some Paper servers use) by echoing it
-//   back immediately via `pong`.
+// DonutSMP (Paper) sends keep_alive packets roughly every 20s.
+// Setting this to 10s (as previously done) caused mineflayer to
+// kill the connection before the server's first keep_alive arrived.
+//
+// 60s gives a generous window: the server sends keep_alive ~every
+// 20s, so we'll always receive one well before the 60s deadline.
 // ============================================================
-const CHECK_TIMEOUT_INTERVAL_MS = 10 * 1000; // 10s — respond to keep-alives fast
+const CHECK_TIMEOUT_INTERVAL_MS = 60 * 1000; // 60s — must be longer than server's keep-alive interval
 
 // ============================================================
 // DONUTSMP SETTINGS
@@ -442,9 +441,10 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
         auth: "microsoft",
         profilesFolder: tokenDir,
         onMsaCode: (data) => handleDeviceCode(minecraftUser, onDeviceCode, data, botId),
-        // Use a shorter check interval so we respond to keep-alive packets
-        // well within the server's timeout window (DonutSMP kicks at 30s).
-        // 10s gives us 3x margin before the server would time us out.
+        // checkTimeoutInterval is the duration mineflayer waits WITHOUT receiving
+        // a keep_alive packet before it kills the connection. It must be longer
+        // than the server's keep-alive interval (Paper sends keep_alive ~every 20s).
+        // 60s gives plenty of margin on either side.
         checkTimeoutInterval: CHECK_TIMEOUT_INTERVAL_MS,
       });
     } catch (err) {
