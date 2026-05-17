@@ -67,6 +67,22 @@ function clearAuthCache(username) {
 const activeBots = new Map();
 const recentlyEndedBots = [];
 
+// ============================================================
+// FRESHSMP: pending gamemode selections
+// Map<botId, { resolve: Function, timer: NodeJS.Timeout }>
+// When the Discord bot POSTs a gamemode selection, we resolve
+// the pending promise so the bot can send the /queue command.
+// ============================================================
+const pendingFreshSmpGamemode = new Map();
+const FRESHSMP_GAMEMODE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes to pick a gamemode
+
+// Valid FreshSMP gamemodes and their /queue argument
+const FRESHSMP_GAMEMODES = {
+  survival: "survival",
+  lifesteal: "lifesteal",
+  skywars: "skywars",
+};
+
 function recordEndedBot(entry, endReason) {
   if (endReason === "manual_stop" || endReason === "stopall" || endReason === "stop_user_all") return;
   recentlyEndedBots.push({
@@ -91,19 +107,8 @@ const MAX_BOTS = parseInt(process.env.MAX_BOTS || "0", 10);
 
 // ============================================================
 // KEEP-ALIVE TIMEOUT SETTINGS
-//
-// checkTimeoutInterval is the duration mineflayer waits WITHOUT
-// receiving a keep_alive packet before it declares a timeout and
-// kills the connection. It is NOT a polling interval.
-//
-// DonutSMP (Paper) sends keep_alive packets roughly every 20s.
-// Setting this to 10s (as previously done) caused mineflayer to
-// kill the connection before the server's first keep_alive arrived.
-//
-// 60s gives a generous window: the server sends keep_alive ~every
-// 20s, so we'll always receive one well before the 60s deadline.
 // ============================================================
-const CHECK_TIMEOUT_INTERVAL_MS = 60 * 1000; // 60s — must be longer than server's keep-alive interval
+const CHECK_TIMEOUT_INTERVAL_MS = 60 * 1000;
 
 // ============================================================
 // DONUTSMP SETTINGS
@@ -113,10 +118,25 @@ const DONUTSMP_MAX_VERIFICATION_RETRIES = 10;
 const DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS = 5000;
 const DONUTSMP_STRICT_VERSION = "1.21.11";
 
+// ============================================================
+// FRESHSMP SETTINGS
+// ============================================================
+const FRESHSMP_HOST_PATTERNS = ["freshsmp.net", "freshsmp", "elementalmc.live", "play.elementalmc.live"];
+const FRESHSMP_STRICT_VERSION = "1.21.11";
+// Delay (ms) after spawn before sending /queue — gives the server time
+// to finish loading the player in before accepting commands.
+const FRESHSMP_QUEUE_COMMAND_DELAY_MS = 3000;
+
 function isDonutSmpHost(host) {
   if (!host) return false;
   const lower = host.toLowerCase();
   return DONUTSMP_HOST_PATTERNS.some(p => lower.includes(p));
+}
+
+function isFreshSmpHost(host) {
+  if (!host) return false;
+  const lower = host.toLowerCase();
+  return FRESHSMP_HOST_PATTERNS.some(p => lower.includes(p));
 }
 
 function isDonutSmpVerificationKick(reasonText) {
@@ -286,14 +306,6 @@ function sendClientSettings(bot, username, context) {
 
 // ============================================================
 // DONUTSMP MOVEMENT SUPPRESSION
-//
-// Permanently block autonomous position/flying/look packets for the
-// entire session. An AFK bot has no reason to send them at all.
-//   - `position`      = autonomous heartbeat (BLOCK FOREVER)
-//   - `flying`        = on-ground heartbeat (BLOCK FOREVER)
-//   - `look`          = head rotation (BLOCK FOREVER)
-//   - `position_look` = teleport echo response (ALWAYS ALLOW)
-// All other packets pass freely.
 // ============================================================
 function installDonutSmpMovementBlock(bot, entry, botId, minecraftUser) {
   entry.donutSmpReadyAt = 0;
@@ -324,15 +336,6 @@ function installDonutSmpMovementBlock(bot, entry, botId, minecraftUser) {
     return origWrite(name, params);
   };
 
-  // ── Explicit ping/pong handler ──────────────────────────────────────────
-  // Some Paper servers (including DonutSMP) send a `ping` packet as an
-  // additional liveness check separate from `keep_alive`. mineflayer does
-  // NOT automatically respond to this. If we don't pong, the server's
-  // connection watchdog eventually kicks us with disconnect.timeout.
-  //
-  // We listen on the raw _client for the `ping` packet and immediately
-  // write back a `pong` with the same id. This runs outside the movement
-  // block since `pong` is not in the BLOCK set.
   bot._client.on("ping", (packet) => {
     try {
       origWrite("pong", { id: packet.id });
@@ -348,7 +351,77 @@ function installDonutSmpMovementBlock(bot, entry, botId, minecraftUser) {
   );
 }
 
-function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode = null, onLinkVerified = null) {
+// ============================================================
+// FRESHSMP: Send gamemode queue command
+//
+// Called either immediately after spawn (if gamemode was
+// pre-selected) or after the Discord user picks one via DM button.
+// ============================================================
+function sendFreshSmpQueueCommand(botId, gamemode) {
+  const entry = activeBots.get(botId);
+  if (!entry) {
+    console.warn(`[botmanager] ⚠️ [FreshSMP] sendFreshSmpQueueCommand: bot ${botId} not found`);
+    return { success: false, reason: "bot_not_found" };
+  }
+
+  if (!entry.bot) {
+    console.warn(`[botmanager] ⚠️ [FreshSMP] sendFreshSmpQueueCommand: bot instance missing for ${botId}`);
+    return { success: false, reason: "bot_instance_missing" };
+  }
+
+  if (entry.status !== "online") {
+    console.warn(`[botmanager] ⚠️ [FreshSMP] sendFreshSmpQueueCommand: bot ${botId} is not online (status: ${entry.status})`);
+    return { success: false, reason: "bot_not_online" };
+  }
+
+  const gamemodeKey = String(gamemode || "").toLowerCase();
+  const queueArg = FRESHSMP_GAMEMODES[gamemodeKey];
+  if (!queueArg) {
+    console.warn(`[botmanager] ⚠️ [FreshSMP] Unknown gamemode: ${gamemode}`);
+    return { success: false, reason: "unknown_gamemode" };
+  }
+
+  // Resolve the pending gamemode promise if one exists (from the spawn wait)
+  const pending = pendingFreshSmpGamemode.get(botId);
+  if (pending) {
+    clearTimeout(pending.timer);
+    pendingFreshSmpGamemode.delete(botId);
+    pending.resolve(queueArg);
+    console.log(`[botmanager] 🎮 [FreshSMP] Gamemode resolved via pending promise for ${botId}: /${queueArg}`);
+    return { success: true, gamemode: queueArg };
+  }
+
+  // No pending promise — send command directly (e.g. called after timeout or re-queue)
+  try {
+    entry.bot.chat(`/queue ${queueArg}`);
+    entry.freshSmpGamemode = queueArg;
+    console.log(`[botmanager] 🎮 [FreshSMP] Sent /queue ${queueArg} for ${entry.minecraftUser}`);
+    return { success: true, gamemode: queueArg };
+  } catch (err) {
+    console.error(`[botmanager] ❌ [FreshSMP] Failed to send /queue ${queueArg} for ${entry.minecraftUser}:`, err.message);
+    return { success: false, reason: "chat_failed", error: err.message };
+  }
+}
+
+// ============================================================
+// FRESHSMP: Wait for gamemode selection
+//
+// Returns a Promise that resolves with the chosen queueArg
+// (e.g. "survival") when the Discord user clicks a button,
+// or rejects after FRESHSMP_GAMEMODE_TIMEOUT_MS.
+// ============================================================
+function waitForFreshSmpGamemode(botId) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pendingFreshSmpGamemode.delete(botId);
+      reject(new Error("gamemode_selection_timeout"));
+    }, FRESHSMP_GAMEMODE_TIMEOUT_MS);
+
+    pendingFreshSmpGamemode.set(botId, { resolve, timer });
+  });
+}
+
+function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode = null, onLinkVerified = null, onFreshSmpSpawned = null) {
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
   console.log(`[botmanager] 🤖 Starting bot`);
   console.log(`  Discord ID:   ${discordId}`);
@@ -384,10 +457,16 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
 
   const tokenDir = ensureAccountDir(minecraftUser);
   const isDonutSmp = isDonutSmpHost(hostLower);
+  const isFreshSmp = !isDonutSmp && isFreshSmpHost(hostLower);
 
   if (isDonutSmp && effectiveVersion !== DONUTSMP_STRICT_VERSION) {
     console.warn(`[botmanager] 🛡️ DonutSMP strict version override: ${effectiveVersion} -> ${DONUTSMP_STRICT_VERSION}`);
     effectiveVersion = DONUTSMP_STRICT_VERSION;
+  }
+
+  if (isFreshSmp && effectiveVersion !== FRESHSMP_STRICT_VERSION) {
+    console.warn(`[botmanager] 🟢 FreshSMP strict version override: ${effectiveVersion} -> ${FRESHSMP_STRICT_VERSION}`);
+    effectiveVersion = FRESHSMP_STRICT_VERSION;
   }
 
   const entry = {
@@ -395,10 +474,14 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     serverHost: host, serverPort: port, version: effectiveVersion,
     startedAt: new Date().toISOString(),
     status: "connecting", spawnError: null, spawnTimeoutId: null,
-    deviceCodeEmitted: false, bot: null, isDonutSmp,
+    deviceCodeEmitted: false, bot: null, isDonutSmp, isFreshSmp,
     donutSmpVerificationRetries: 0, connectedSince: null,
     donutSmpQuietUntil: 0,
     donutSmpReadyAt: 0,
+    // FreshSMP: stores chosen gamemode after selection (e.g. "survival")
+    freshSmpGamemode: null,
+    // FreshSMP: set to true once /queue has been sent this session
+    freshSmpQueueSent: false,
   };
 
   activeBots.set(botId, entry);
@@ -441,10 +524,6 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
         auth: "microsoft",
         profilesFolder: tokenDir,
         onMsaCode: (data) => handleDeviceCode(minecraftUser, onDeviceCode, data, botId),
-        // checkTimeoutInterval is the duration mineflayer waits WITHOUT receiving
-        // a keep_alive packet before it kills the connection. It must be longer
-        // than the server's keep-alive interval (Paper sends keep_alive ~every 20s).
-        // 60s gives plenty of margin on either side.
         checkTimeoutInterval: CHECK_TIMEOUT_INTERVAL_MS,
       });
     } catch (err) {
@@ -494,16 +573,26 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       saveToken(minecraftUser);
 
       if (isDonutSmp) {
-        // Install movement block AND ping/pong handler.
         installDonutSmpMovementBlock(bot, e, botId, minecraftUser);
         console.log(`[botmanager] 🟠 DonutSMP login — movement block + ping/pong active. Monitoring for verification disconnect (retry ${e.donutSmpVerificationRetries}/${DONUTSMP_MAX_VERIFICATION_RETRIES})`);
-      } else {
-        // For non-DonutSMP servers, also handle ping/pong since some Paper
-        // servers use it regardless of anti-cheat configuration.
+      } else if (isFreshSmp) {
+        // ping/pong for Paper-based servers
         bot._client.on("ping", (packet) => {
-          try {
-            bot._client.write("pong", { id: packet.id });
-          } catch (_) {}
+          try { bot._client.write("pong", { id: packet.id }); } catch (_) {}
+        });
+
+        setTimeout(() => {
+          if (!activeBots.has(botId) || entry.bot !== bot) return;
+          sendClientSettings(bot, minecraftUser, "post-login");
+        }, 1000);
+
+        // Fire the onFreshSmpSpawned callback so the Discord bot can DM
+        // the gamemode selector. Then wait for the user's selection before
+        // sending /queue. This runs async so it doesn't block login handling.
+        _handleFreshSmpGamemodeFlow(botId, minecraftUser, bot, onFreshSmpSpawned);
+      } else {
+        bot._client.on("ping", (packet) => {
+          try { bot._client.write("pong", { id: packet.id }); } catch (_) {}
         });
 
         setTimeout(() => {
@@ -534,6 +623,7 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     bot.once("spawn", () => {
       if (!activeBots.has(botId)) return;
       if (isDonutSmp) console.log(`[botmanager] 🟠 DonutSMP spawn fired for ${minecraftUser} — movement block active`);
+      if (isFreshSmp) console.log(`[botmanager] 🟢 FreshSMP spawn fired for ${minecraftUser} — awaiting gamemode selection`);
     });
 
     // ── Kicked ───────────────────────────────────────────────────────────────
@@ -544,6 +634,15 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       const e = activeBots.get(botId);
       if (entry.bot !== bot) return;
       if (e.status === "reconnecting" && !e.isDonutSmp) return;
+
+      // Cancel any pending FreshSMP gamemode wait
+      if (isFreshSmp) {
+        const pending = pendingFreshSmpGamemode.get(botId);
+        if (pending) {
+          clearTimeout(pending.timer);
+          pendingFreshSmpGamemode.delete(botId);
+        }
+      }
 
       if (e.isDonutSmp && isDonutSmpVerificationKick(reasonText)) {
         console.log(`[botmanager] 🟠 DonutSMP verification kick for ${minecraftUser} — scheduling retry`);
@@ -586,6 +685,15 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       const errCode = err.code;
       const errMessage = err.message || "";
       console.error(`[botmanager] ❌ Bot error (${minecraftUser}):`, errMessage);
+
+      // Cancel any pending FreshSMP gamemode wait
+      if (isFreshSmp) {
+        const pending = pendingFreshSmpGamemode.get(botId);
+        if (pending) {
+          clearTimeout(pending.timer);
+          pendingFreshSmpGamemode.delete(botId);
+        }
+      }
 
       const isAuthError = errMessage.includes("invalid_grant") || errMessage.includes("AADSTS") ||
                           errMessage.includes("authentication") || errMessage.toLowerCase().includes("token");
@@ -633,6 +741,15 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       if (e.status === "reconnecting" && !e.isDonutSmp) return;
 
       console.log(`[botmanager] 🔌 Bot disconnected (${minecraftUser}): ${reason}`);
+
+      // Cancel any pending FreshSMP gamemode wait
+      if (isFreshSmp) {
+        const pending = pendingFreshSmpGamemode.get(botId);
+        if (pending) {
+          clearTimeout(pending.timer);
+          pendingFreshSmpGamemode.delete(botId);
+        }
+      }
 
       const isVerificationEvent =
         (e.isDonutSmp && isDonutSmpVerificationDisconnect(reason, e.connectedSince)) || kickHandled;
@@ -682,6 +799,61 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
   return { success: true, botId };
 }
 
+// ============================================================
+// FRESHSMP GAMEMODE FLOW (async, fires after login)
+//
+// 1. Calls onFreshSmpSpawned so the Discord bot knows the bot
+//    is online and can DM the gamemode selector embed.
+// 2. Waits for the user to click a button (resolves the pending
+//    promise via sendFreshSmpQueueCommand / waitForFreshSmpGamemode).
+// 3. Sends /queue <gamemode> after a short stabilisation delay.
+// 4. Marks freshSmpQueueSent on the entry so the status embed
+//    can reflect which gamemode the bot is in.
+// ============================================================
+async function _handleFreshSmpGamemodeFlow(botId, minecraftUser, bot, onFreshSmpSpawned) {
+  // Notify the Discord bot that we're online and need a gamemode selection
+  if (typeof onFreshSmpSpawned === "function") {
+    try { onFreshSmpSpawned(botId); }
+    catch (err) { console.warn(`[botmanager] ⚠️ [FreshSMP] onFreshSmpSpawned callback threw:`, err.message); }
+  }
+
+  let chosenGamemode;
+  try {
+    console.log(`[botmanager] 🟢 [FreshSMP] Waiting for gamemode selection for ${minecraftUser}...`);
+    chosenGamemode = await waitForFreshSmpGamemode(botId);
+  } catch (err) {
+    // Timed out — bot stays connected but /queue was never sent
+    console.warn(`[botmanager] ⚠️ [FreshSMP] Gamemode selection timed out for ${minecraftUser}. Bot remains connected but /queue not sent.`);
+    return;
+  }
+
+  // Check the bot is still active before sending
+  if (!activeBots.has(botId)) {
+    console.warn(`[botmanager] ⚠️ [FreshSMP] Bot ${botId} gone before /queue could be sent`);
+    return;
+  }
+
+  const entry = activeBots.get(botId);
+  if (entry.bot !== bot || entry.status !== "online") {
+    console.warn(`[botmanager] ⚠️ [FreshSMP] Bot ${botId} no longer online, skipping /queue`);
+    return;
+  }
+
+  // Short delay to let the server fully stabilise after login
+  await new Promise(r => setTimeout(r, FRESHSMP_QUEUE_COMMAND_DELAY_MS));
+
+  if (!activeBots.has(botId) || activeBots.get(botId).bot !== bot) return;
+
+  try {
+    bot.chat(`/queue ${chosenGamemode}`);
+    entry.freshSmpGamemode = chosenGamemode;
+    entry.freshSmpQueueSent = true;
+    console.log(`[botmanager] 🟢 [FreshSMP] Sent /queue ${chosenGamemode} for ${minecraftUser}`);
+  } catch (err) {
+    console.error(`[botmanager] ❌ [FreshSMP] Failed to send /queue ${chosenGamemode} for ${minecraftUser}:`, err.message);
+  }
+}
+
 function stopBot(discordId, minecraftUser) {
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
   console.log(`[botmanager] 🛑 Stopping bot — discordId: ${discordId}, mc: ${minecraftUser}`);
@@ -691,6 +863,12 @@ function stopBot(discordId, minecraftUser) {
     console.warn(`[botmanager] ⚠️ No bot running for ${botId}`);
     console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
     return { success: false, reason: "no_bot_running" };
+  }
+  // Cancel any pending FreshSMP gamemode wait before cleanup
+  const pending = pendingFreshSmpGamemode.get(botId);
+  if (pending) {
+    clearTimeout(pending.timer);
+    pendingFreshSmpGamemode.delete(botId);
   }
   cleanupBot(botId, "manual_stop");
   console.log(`[botmanager] ✅ Bot stopped for ${minecraftUser}`);
@@ -703,7 +881,12 @@ function stopBotsForUser(discordId) {
   const prefix = `${discordId}:`;
   let count = 0;
   for (const botId of [...activeBots.keys()]) {
-    if (botId.startsWith(prefix)) { cleanupBot(botId, "stop_user_all"); count++; }
+    if (botId.startsWith(prefix)) {
+      const pending = pendingFreshSmpGamemode.get(botId);
+      if (pending) { clearTimeout(pending.timer); pendingFreshSmpGamemode.delete(botId); }
+      cleanupBot(botId, "stop_user_all");
+      count++;
+    }
   }
   return { success: true, stopped: count };
 }
@@ -711,7 +894,11 @@ function stopBotsForUser(discordId) {
 function stopAllBots() {
   const count = activeBots.size;
   console.log(`[botmanager] 🚨 Stopping all ${count} bot(s)`);
-  for (const botId of [...activeBots.keys()]) cleanupBot(botId, "stopall");
+  for (const botId of [...activeBots.keys()]) {
+    const pending = pendingFreshSmpGamemode.get(botId);
+    if (pending) { clearTimeout(pending.timer); pendingFreshSmpGamemode.delete(botId); }
+    cleanupBot(botId, "stopall");
+  }
   return { success: true, stopped: count };
 }
 
@@ -739,6 +926,10 @@ function getBotStatus(discordId, minecraftUser) {
       spawnError: entry.spawnError || null, errorCategory: entry.errorCategory || null,
       uptimeSeconds: Math.floor((Date.now() - new Date(entry.startedAt).getTime()) / 1000),
       donutSmpVerificationRetries: entry.isDonutSmp ? entry.donutSmpVerificationRetries : undefined,
+      // FreshSMP fields exposed to Discord bot
+      isFreshSmp: entry.isFreshSmp || false,
+      freshSmpGamemode: entry.freshSmpGamemode || null,
+      freshSmpQueueSent: entry.freshSmpQueueSent || false,
     },
   };
 }
@@ -754,6 +945,9 @@ function getBotsForUser(discordId) {
         startedAt: entry.startedAt, status: entry.status,
         spawnError: entry.spawnError || null, errorCategory: entry.errorCategory || null,
         uptimeSeconds: Math.floor((Date.now() - new Date(entry.startedAt).getTime()) / 1000),
+        isFreshSmp: entry.isFreshSmp || false,
+        freshSmpGamemode: entry.freshSmpGamemode || null,
+        freshSmpQueueSent: entry.freshSmpQueueSent || false,
       });
     }
   }
@@ -768,10 +962,13 @@ function listAllBots() {
     serverHost: entry.serverHost, serverPort: entry.serverPort, version: entry.version,
     startedAt: entry.startedAt, status: entry.status,
     uptimeSeconds: Math.floor((Date.now() - new Date(entry.startedAt).getTime()) / 1000),
+    isFreshSmp: entry.isFreshSmp || false,
+    freshSmpGamemode: entry.freshSmpGamemode || null,
   }));
 }
 
 module.exports = {
   makeBotId, startBot, stopBot, stopBotsForUser, stopAllBots,
   getBotStatus, getBotsForUser, listAllBots, getBotCount, getAndClearRecentlyEnded,
+  sendFreshSmpQueueCommand,
 };
