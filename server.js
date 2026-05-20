@@ -40,7 +40,7 @@ const {
   sendFreshSmpQueueCommand,
 } = require("./botmanager");
 
-const { getProfileForHost } = require("./profiles/index");
+const { getProfileForHost } = require("./index");
 
 const app = express();
 app.use(express.json());
