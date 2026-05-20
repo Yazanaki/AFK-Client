@@ -1,46 +1,63 @@
 "use strict";
 
 const { BaseProfile } = require("./BaseProfile");
-const { HungerHandler } = require("../behavior/HungerHandler");
 
 /**
- * Default profile for vanilla / Paper servers.
- * Keeps behavior simple and close to a vanilla client.
- * Includes automatic hunger management (eats food when hungry).
+ * DefaultProfile — used for any server that doesn't match a specific profile.
+ *
+ * Behaviour:
+ *   - Uses the version provided by the caller (or auto-detection)
+ *   - Handles ping/pong for Paper servers
+ *   - Sends client settings after login
+ *   - No movement suppression
  */
 class DefaultProfile extends BaseProfile {
   constructor() {
-    super("default", ["1.21.4"]);
-    this._hungerHandler = null;
+    // "auto" signals botmanager to use version auto-detection for this profile
+    super("default", "auto");
   }
 
-  buildClientOptions(baseOptions /*, session */) {
-    return {
-      ...baseOptions,
-      // Let the server think we're close to vanilla.
-      brand: "vanilla",
-    };
-  }
-
-  attachHandlers(client, session) {
-    // Resolve the negotiated version from the session (set during connect).
-    const version = (session && session.version) ? String(session.version) : "1.21.4";
-    this._hungerHandler = new HungerHandler(version);
-    this._hungerHandler.attach(client);
-
-    client.on("keep_alive", () => {
-      // minecraft-protocol handles responding automatically.
+  onBotCreated(bot, entry, botId, spawnBot) {
+    // Handle ping/pong — some Paper servers use this separate from keep_alive
+    bot._client.on("ping", (packet) => {
+      try {
+        bot._client.write("pong", { id: packet.id });
+      } catch (_) {}
     });
   }
 
-  tick(session, client, nowMs) {
-    if (session.state !== "online") return;
-    if (this._hungerHandler) {
-      this._hungerHandler.tick(client);
+  onLogin(bot, entry, botId, spawnBot, callbacks) {
+    // Send client settings 1s after login to let the server settle
+    setTimeout(() => {
+      if (!bot || bot._client?.ended) return;
+      _sendClientSettings(bot, entry.minecraftUser, "post-login");
+    }, 1000);
+
+    const { onLinkVerified } = callbacks || {};
+    if (typeof onLinkVerified === "function") {
+      try { onLinkVerified(entry.discordId, entry.minecraftUser); } catch (_) {}
     }
   }
 }
 
-module.exports = {
-  DefaultProfile,
-};
+// ─── Shared utility ────────────────────────────────────────────────────────────
+
+function _sendClientSettings(bot, username, context) {
+  console.log(`[botmanager] 📋 [${username}] Sending client settings (context: ${context})`);
+  try {
+    bot._client.write("settings", {
+      locale: "en_US",
+      viewDistance: 8,
+      chatFlags: 0,
+      chatColors: true,
+      skinParts: 127,
+      mainHand: 1,
+      enableTextFiltering: false,
+      enableServerListing: true,
+    });
+  } catch (err) {
+    console.warn(`[botmanager] ⚠️ [${username}] Could not send client settings:`, err.message);
+  }
+}
+
+module.exports = { DefaultProfile, _sendClientSettings };

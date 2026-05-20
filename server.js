@@ -1,5 +1,10 @@
 // yazanaki/mcbot/server.js (VPS-side)
 // Express API server — receives bot commands from KenzAI Discord Bot.
+//
+// This file is intentionally free of server-specific logic (version overrides,
+// host pattern checks, anti-cheat behaviour). All of that lives in the profile
+// files under profiles/. Add a new server by creating profiles/YourProfile.js
+// and registering it in profiles/index.js.
 
 "use strict";
 
@@ -20,6 +25,7 @@ console.warn = (...args) => {
 require("dotenv").config();
 
 const express = require("express");
+
 const {
   makeBotId,
   startBot,
@@ -34,27 +40,13 @@ const {
   sendFreshSmpQueueCommand,
 } = require("./botmanager");
 
+const { getProfileForHost } = require("./profiles/index");
+
 const app = express();
 app.use(express.json());
 
 const PORT = parseInt(process.env.PORT || "4823", 10);
 const API_KEY = process.env.API_KEY;
-const DONUTSMP_HOST_PATTERNS = ["donutsmp.net", "donutsmp"];
-const DONUTSMP_STRICT_VERSION = "1.21.11";
-const FRESHSMP_HOST_PATTERNS = ["freshsmp.net", "freshsmp", "elementalmc.live", "play.elementalmc.live"];
-const FRESHSMP_STRICT_VERSION = "1.21.11";
-
-function isDonutSmpHost(host) {
-  const lower = String(host || "").toLowerCase();
-  if (!lower) return false;
-  return DONUTSMP_HOST_PATTERNS.some((p) => lower.includes(p));
-}
-
-function isFreshSmpHost(host) {
-  const lower = String(host || "").toLowerCase();
-  if (!lower) return false;
-  return FRESHSMP_HOST_PATTERNS.some((p) => lower.includes(p));
-}
 
 if (!API_KEY || API_KEY.trim() === "" || API_KEY === "REPLACE_WITH_A_LONG_RANDOM_SECRET") {
   console.error("❌ FATAL: API_KEY is not set in .env. Refusing to start.");
@@ -80,7 +72,7 @@ const LINK_VERIFIED_EXPIRY_MS = 5 * 60 * 1000;
 // Consumed once by the Discord bot's poll loop.
 // ============================================================
 const pendingFreshSmpSpawned = new Map();
-const FRESHSMP_SPAWNED_EXPIRY_MS = 10 * 60 * 1000; // 10 min safety TTL
+const FRESHSMP_SPAWNED_EXPIRY_MS = 10 * 60 * 1000;
 
 // ============================================================
 // MIDDLEWARE — API Key Auth
@@ -114,13 +106,21 @@ app.get("/ping", (req, res) => {
 // ============================================================
 // ROUTE: Start Bot
 // POST /start
-// Body: { discordId, minecraftUser, serverAddress, version, forLinkVerification? }
+// Body: { discordId, minecraftUser, serverAddress, version?, forLinkVerification? }
+//
+// `version` is optional. If omitted or "auto", the profile for the target
+// server decides the version (fixed or auto-detected). If provided and the
+// profile has a fixed version, the profile's version always wins — a warning
+// is logged in botmanager.
 // ============================================================
 
 app.post("/start", (req, res) => {
   const { discordId, minecraftUser, serverAddress, version, forLinkVerification } = req.body;
 
-  console.log(`[server] 📥 POST /start — discordId=${discordId} mc=${minecraftUser} server=${serverAddress} v=${version} linkOnly=${!!forLinkVerification}`);
+  console.log(
+    `[server] 📥 POST /start — discordId=${discordId} mc=${minecraftUser} ` +
+    `server=${serverAddress} v=${version || "auto"} linkOnly=${!!forLinkVerification}`
+  );
 
   if (!discordId || typeof discordId !== "string") {
     return res.status(400).json({ ok: false, error: "Missing or invalid discordId" });
@@ -134,76 +134,65 @@ app.post("/start", (req, res) => {
 
   const botId = makeBotId(discordId.trim(), minecraftUser.trim());
 
-  // Clear any stale device code from a previous run for this specific bot
-  if (pendingDeviceCodes.has(botId)) {
-    console.log(`[server] 🧹 Clearing stale device code for ${botId} before new start`);
-    pendingDeviceCodes.delete(botId);
-  }
+  // Clear stale pending state from any previous run for this bot
+  pendingDeviceCodes.delete(botId);
+  pendingFreshSmpSpawned.delete(botId);
 
-  // Clear any stale FreshSMP spawned notification
-  if (pendingFreshSmpSpawned.has(botId)) {
-    pendingFreshSmpSpawned.delete(botId);
-  }
+  // ── Callbacks ──────────────────────────────────────────────────────────────
 
-  // Device code callback — always overwrite with the latest code.
   const onDeviceCode = (userCode, verificationUri, expiresIn) => {
-    const ENFORCED_DEVICE_CODE_TTL_SEC = 5 * 60;
+    // Enforce a 5-minute maximum TTL regardless of what the auth server says
+    const ENFORCED_TTL_SEC = 5 * 60;
     const effectiveExpiresIn = Math.min(
-      typeof expiresIn === "number" ? expiresIn : ENFORCED_DEVICE_CODE_TTL_SEC,
-      ENFORCED_DEVICE_CODE_TTL_SEC
+      typeof expiresIn === "number" ? expiresIn : ENFORCED_TTL_SEC,
+      ENFORCED_TTL_SEC
     );
-    const expiresAt = Date.now() + (effectiveExpiresIn * 1000);
+    const expiresAt = Date.now() + effectiveExpiresIn * 1000;
     const existing = pendingDeviceCodes.get(botId);
     if (existing && existing.userCode !== userCode) {
-      console.log(`[server] 🔄 Updated device code for ${botId}: ${existing.userCode} → ${userCode}`);
+      console.log(
+        `[server] 🔄 Updated device code for ${botId}: ${existing.userCode} → ${userCode}`
+      );
     }
     pendingDeviceCodes.set(botId, { userCode, verificationUri, expiresAt });
-    console.log(`[server] 🔐 Device code stored for ${botId}: ${userCode} @ ${verificationUri}`);
+    console.log(`[server] 🔐 Device code stored for ${botId}: ${userCode}`);
   };
 
   const onLinkVerified = forLinkVerification
     ? (did, mcUsername) => {
-        pendingLinkVerified.set(String(did).trim(), { mcUsername, createdAt: Date.now() });
+        pendingLinkVerified.set(String(did).trim(), {
+          mcUsername,
+          createdAt: Date.now(),
+        });
         console.log(`[server] 🔗 Link verified for ${did}: MC username ${mcUsername}`);
       }
     : null;
 
-  // FreshSMP: callback fired when the bot reaches the lobby and is ready for /queue
-  const onFreshSmpSpawned = isFreshSmpHost(serverAddress)
-    ? (firedBotId) => {
-        pendingFreshSmpSpawned.set(firedBotId, {
-          discordId: discordId.trim(),
-          minecraftUser: minecraftUser.trim(),
-          serverHost: serverAddress.trim(),
-          createdAt: Date.now(),
-        });
-        console.log(`[server] 🟢 FreshSMP bot spawned and ready for gamemode selection: ${firedBotId}`);
-      }
-    : null;
+  // Determine whether this server uses a FreshSMP profile so we know
+  // whether to set up the spawned-notification callback.
+  const serverProfile = getProfileForHost(serverAddress.trim());
+  const onFreshSmpSpawned =
+    serverProfile.id === "freshsmp"
+      ? (firedBotId) => {
+          pendingFreshSmpSpawned.set(firedBotId, {
+            discordId:    discordId.trim(),
+            minecraftUser: minecraftUser.trim(),
+            serverHost:   serverAddress.trim(),
+            createdAt:    Date.now(),
+          });
+          console.log(
+            `[server] 🟢 FreshSMP bot spawned and ready for gamemode selection: ${firedBotId}`
+          );
+        }
+      : null;
 
-  const requestedVersion = String(version || "auto").trim() || "auto";
-  let effectiveVersion = requestedVersion;
-  if (isDonutSmpHost(serverAddress)) {
-    if (requestedVersion.toLowerCase() !== "auto" && requestedVersion !== DONUTSMP_STRICT_VERSION) {
-      console.warn(
-        `[server] 🛡️ DonutSMP strict version override: requested ${requestedVersion} -> ${DONUTSMP_STRICT_VERSION}`
-      );
-    }
-    effectiveVersion = DONUTSMP_STRICT_VERSION;
-  } else if (isFreshSmpHost(serverAddress)) {
-    if (requestedVersion.toLowerCase() !== "auto" && requestedVersion !== FRESHSMP_STRICT_VERSION) {
-      console.warn(
-        `[server] 🟢 FreshSMP strict version override: requested ${requestedVersion} -> ${FRESHSMP_STRICT_VERSION}`
-      );
-    }
-    effectiveVersion = FRESHSMP_STRICT_VERSION;
-  }
+  // ── Start the bot ──────────────────────────────────────────────────────────
 
   const result = startBot(
     discordId.trim(),
     minecraftUser.trim(),
     serverAddress.trim(),
-    effectiveVersion,
+    version ? String(version).trim() : "auto",
     onDeviceCode,
     onLinkVerified,
     onFreshSmpSpawned
@@ -214,7 +203,13 @@ app.post("/start", (req, res) => {
     return res.status(statusCode).json({ ok: false, ...result });
   }
 
-  return res.status(200).json({ ok: true, message: "Bot started", discordId, minecraftUser });
+  return res.status(200).json({
+    ok: true,
+    message: "Bot started",
+    discordId,
+    minecraftUser,
+    profile: serverProfile.id,
+  });
 });
 
 // ============================================================
@@ -223,17 +218,14 @@ app.post("/start", (req, res) => {
 // ============================================================
 
 app.get("/devicecode/:discordId/:minecraftUser", (req, res) => {
-  const discordId = req.params.discordId.trim();
+  const discordId    = req.params.discordId.trim();
   const minecraftUser = req.params.minecraftUser.trim();
-
   const botId = makeBotId(discordId, minecraftUser);
+
   console.log(`[server] 📥 GET /devicecode/${botId}`);
 
   const entry = pendingDeviceCodes.get(botId);
-
-  if (!entry) {
-    return res.status(404).json({ ok: false, pending: false });
-  }
+  if (!entry) return res.status(404).json({ ok: false, pending: false });
 
   if (Date.now() > entry.expiresAt) {
     pendingDeviceCodes.delete(botId);
@@ -243,9 +235,9 @@ app.get("/devicecode/:discordId/:minecraftUser", (req, res) => {
   return res.status(200).json({
     ok: true,
     pending: true,
-    userCode: entry.userCode,
+    userCode:        entry.userCode,
     verificationUri: entry.verificationUri,
-    expiresAt: entry.expiresAt,
+    expiresAt:       entry.expiresAt,
   });
 });
 
@@ -255,9 +247,10 @@ app.get("/devicecode/:discordId/:minecraftUser", (req, res) => {
 // ============================================================
 
 app.delete("/devicecode/:discordId/:minecraftUser", (req, res) => {
-  const discordId = req.params.discordId.trim();
-  const minecraftUser = req.params.minecraftUser.trim();
-  const botId = makeBotId(discordId, minecraftUser);
+  const botId = makeBotId(
+    req.params.discordId.trim(),
+    req.params.minecraftUser.trim()
+  );
   pendingDeviceCodes.delete(botId);
   return res.status(200).json({ ok: true });
 });
@@ -270,13 +263,14 @@ app.delete("/devicecode/:discordId/:minecraftUser", (req, res) => {
 app.get("/link/verified/:discordId", (req, res) => {
   const discordId = req.params.discordId.trim();
   const entry = pendingLinkVerified.get(discordId);
-  if (!entry) {
-    return res.status(404).json({ ok: false, reason: "no_result" });
-  }
+
+  if (!entry) return res.status(404).json({ ok: false, reason: "no_result" });
+
   if (Date.now() - entry.createdAt > LINK_VERIFIED_EXPIRY_MS) {
     pendingLinkVerified.delete(discordId);
     return res.status(404).json({ ok: false, reason: "expired" });
   }
+
   pendingLinkVerified.delete(discordId);
   return res.status(200).json({ ok: true, mcUsername: entry.mcUsername });
 });
@@ -285,38 +279,32 @@ app.get("/link/verified/:discordId", (req, res) => {
 // ROUTE: Check for FreshSMP gamemode selector trigger
 // GET /freshsmp/spawned/:discordId/:minecraftUser
 //
-// The Discord bot's poll loop calls this. Returns { ok, pending }
-// with pending=true when the bot has just joined the FreshSMP lobby
-// and is waiting for the user to select a gamemode.
-// This is consume-once — the entry is deleted on successful read.
+// Consume-once — entry is deleted on successful read.
 // ============================================================
 
 app.get("/freshsmp/spawned/:discordId/:minecraftUser", (req, res) => {
-  const discordId = req.params.discordId.trim();
-  const minecraftUser = req.params.minecraftUser.trim();
-  const botId = makeBotId(discordId, minecraftUser);
+  const botId = makeBotId(
+    req.params.discordId.trim(),
+    req.params.minecraftUser.trim()
+  );
 
   const entry = pendingFreshSmpSpawned.get(botId);
-  if (!entry) {
-    return res.status(404).json({ ok: false, pending: false });
-  }
+  if (!entry) return res.status(404).json({ ok: false, pending: false });
 
-  // Expire stale entries (safety net)
   if (Date.now() - entry.createdAt > FRESHSMP_SPAWNED_EXPIRY_MS) {
     pendingFreshSmpSpawned.delete(botId);
     return res.status(404).json({ ok: false, pending: false, reason: "expired" });
   }
 
-  // Consume the notification
   pendingFreshSmpSpawned.delete(botId);
   console.log(`[server] 📥 GET /freshsmp/spawned/${botId} — consumed`);
 
   return res.status(200).json({
-    ok: true,
-    pending: true,
-    discordId: entry.discordId,
+    ok:           true,
+    pending:      true,
+    discordId:    entry.discordId,
     minecraftUser: entry.minecraftUser,
-    serverHost: entry.serverHost,
+    serverHost:   entry.serverHost,
   });
 });
 
@@ -324,15 +312,15 @@ app.get("/freshsmp/spawned/:discordId/:minecraftUser", (req, res) => {
 // ROUTE: Send FreshSMP gamemode selection
 // POST /freshsmp/gamemode
 // Body: { discordId, minecraftUser, gamemode }
-//
-// Called by the Discord bot when the user clicks a gamemode button.
-// Resolves the pending promise in botmanager so the bot sends /queue.
 // ============================================================
 
 app.post("/freshsmp/gamemode", (req, res) => {
   const { discordId, minecraftUser, gamemode } = req.body;
 
-  console.log(`[server] 📥 POST /freshsmp/gamemode — discordId=${discordId} mc=${minecraftUser} gamemode=${gamemode}`);
+  console.log(
+    `[server] 📥 POST /freshsmp/gamemode — ` +
+    `discordId=${discordId} mc=${minecraftUser} gamemode=${gamemode}`
+  );
 
   if (!discordId || typeof discordId !== "string") {
     return res.status(400).json({ ok: false, error: "Missing or invalid discordId" });
@@ -394,15 +382,16 @@ app.post("/stop", (req, res) => {
 // ============================================================
 
 app.get("/status/:discordId/:minecraftUser", (req, res) => {
-  const discordId = req.params.discordId.trim();
+  const discordId    = req.params.discordId.trim();
   const minecraftUser = req.params.minecraftUser.trim();
 
   console.log(`[server] 📥 GET /status/${discordId}/${minecraftUser}`);
 
   const status = getBotStatus(discordId, minecraftUser);
-
   if (!status.found) {
-    return res.status(404).json({ ok: false, reason: "no_bot_running", discordId, minecraftUser });
+    return res.status(404).json({
+      ok: false, reason: "no_bot_running", discordId, minecraftUser,
+    });
   }
 
   return res.status(200).json({ ok: true, bot: status.bot });

@@ -1,173 +1,107 @@
-/* AFK Core main entrypoint
- * Lightweight HTTP API around minecraft-protocol sessions.
- */
-
 "use strict";
 
-const path = require("path");
-const Fastify = require("fastify");
+/**
+ * profiles/index.js — Profile Registry
+ *
+ * Single source of truth for:
+ *   1. Which host patterns map to which profile
+ *   2. Whether a server uses a fixed version or auto-detection
+ *   3. Profile instance singletons (one per profile type)
+ *
+ * To add a new server:
+ *   1. Create profiles/YourServerProfile.js extending BaseProfile
+ *   2. Add an entry to HOST_PROFILES below
+ *   3. That's it — botmanager and server.js pick it up automatically
+ */
 
-const { SessionManager } = require("./session/SessionManager");
-const { FileTokenAuthProvider } = require("./auth/FileTokenAuthProvider");
-const { DefaultProfile } = require("./profile/DefaultProfile");
-const { DonutSmpProfile } = require("./profile/DonutSmpProfile");
-const { FreshSmpProfile } = require("./profile/FreshSmpProfile");
-const { HypixelProfile } = require("./profile/HypixelProfile");
-const { buildMetricsSnapshot } = require("./metrics/metrics");
+const { DefaultProfile } = require("./DefaultProfile");
+const { DonutSmpProfile } = require("./DonutSmpProfile");
+const { FreshSmpProfile } = require("./FreshSmpProfile");
+const { HypixelProfile } = require("./HypixelProfile");
 
-const fastify = Fastify({
-  logger: true,
-});
-
-// Where to look for existing Microsoft auth cache / tokens.
-const DEFAULT_TOKENS_DIR = path.join(__dirname, "..", "..", "tokens");
-
-const authProvider = new FileTokenAuthProvider({
-  tokensDir: process.env.TOKENS_DIR || DEFAULT_TOKENS_DIR,
-});
+// ─── Profile singletons ────────────────────────────────────────────────────────
+// We use singletons so that stateful profiles (e.g. FreshSmpProfile with its
+// pending gamemode map) are shared across the lifetime of the process.
 
 const profiles = {
-  default: new DefaultProfile(),
+  default:  new DefaultProfile(),
   donutsmp: new DonutSmpProfile(),
   freshsmp: new FreshSmpProfile(),
-  hypixel: new HypixelProfile(),
+  hypixel:  new HypixelProfile(),
 };
 
-const sessionManager = new SessionManager({ authProvider, profiles });
+// ─── Host pattern → profile mapping ───────────────────────────────────────────
+// Patterns are matched case-insensitively against the server hostname.
+// First match wins — put more specific patterns before generic ones.
 
-// Simple body validation helper
-function requireFields(obj, fields) {
-  const missing = [];
-  for (const field of fields) {
-    if (obj[field] === undefined || obj[field] === null || obj[field] === "") {
-      missing.push(field);
+const HOST_PROFILES = [
+  { patterns: ["donutsmp.net", "donutsmp"],          profileId: "donutsmp" },
+  { patterns: ["freshsmp.net", "freshsmp",
+               "elementalmc.live",
+               "play.elementalmc.live"],             profileId: "freshsmp" },
+  { patterns: ["hypixel.net", "hypixel"],            profileId: "hypixel"  },
+];
+
+// ─── Public API ────────────────────────────────────────────────────────────────
+
+/**
+ * Resolve which profile to use for a given server host.
+ *
+ * @param {string} host - server hostname (e.g. "mc.donutsmp.net")
+ * @returns {BaseProfile} - the matching profile, or DefaultProfile if none matches
+ */
+function getProfileForHost(host) {
+  const lower = String(host || "").toLowerCase();
+
+  for (const { patterns, profileId } of HOST_PROFILES) {
+    if (patterns.some((p) => lower.includes(p))) {
+      return profiles[profileId];
     }
   }
-  return missing;
+
+  return profiles.default;
 }
 
-// POST /session/start
-fastify.post("/session/start", async (request, reply) => {
-  const body = request.body || {};
-  const required = ["sessionId", "minecraftUser", "serverHost"];
-  const missing = requireFields(body, required);
+/**
+ * Get a profile by its explicit ID string.
+ * Returns DefaultProfile if the ID is unknown.
+ *
+ * @param {string} id
+ * @returns {BaseProfile}
+ */
+function getProfileById(id) {
+  return profiles[String(id || "").toLowerCase()] || profiles.default;
+}
 
-  if (missing.length > 0) {
-    return reply.code(400).send({
-      success: false,
-      reason: "validation_error",
-      missing,
-    });
-  }
+/**
+ * Check whether a hostname maps to a profile with a fixed (non-auto) version.
+ * If true, callers should use profile.version directly rather than auto-detecting.
+ *
+ * @param {string} host
+ * @returns {boolean}
+ */
+function hostHasFixedVersion(host) {
+  const profile = getProfileForHost(host);
+  return profile.version !== "auto";
+}
 
-  const profileKey = body.profile || "default";
-  const profile = profiles[profileKey];
-  if (!profile) {
-    return reply.code(400).send({
-      success: false,
-      reason: "unknown_profile",
-      profile: profileKey,
-    });
-  }
+/**
+ * Return the version string botmanager should use for this host.
+ * If the profile has a fixed version, returns that.
+ * Otherwise returns "auto" to trigger version auto-detection in botmanager.
+ *
+ * @param {string} host
+ * @returns {string}
+ */
+function getVersionForHost(host) {
+  const profile = getProfileForHost(host);
+  return profile.version; // "auto" for DefaultProfile, fixed string for others
+}
 
-  const result = await sessionManager.startSession({
-    sessionId: String(body.sessionId),
-    minecraftUser: String(body.minecraftUser),
-    serverHost: String(body.serverHost),
-    serverPort: body.serverPort ? Number(body.serverPort) : 25565,
-    version: body.version ? String(body.version) : "1.21.8",
-    profile,
-    authHandle:
-      body.authHandle || {
-        type: "minecraftUser",
-        value: String(body.minecraftUser),
-      },
-  });
-
-  if (!result.success) {
-    const statusCode =
-      result.reason === "session_exists"
-        ? 409
-        : result.reason === "capacity_reached"
-        ? 503
-        : 400;
-
-    return reply.code(statusCode).send(result);
-  }
-
-  return reply.send({
-    success: true,
-    sessionId: body.sessionId,
-    status: result.status,
-    profile: profile.id,
-  });
-});
-
-// POST /session/stop
-fastify.post("/session/stop", async (request, reply) => {
-  const body = request.body || {};
-  const required = ["sessionId"];
-  const missing = requireFields(body, required);
-
-  if (missing.length > 0) {
-    return reply.code(400).send({
-      success: false,
-      reason: "validation_error",
-      missing,
-    });
-  }
-
-  const result = sessionManager.stopSession(String(body.sessionId));
-  if (!result.success) {
-    return reply.code(404).send(result);
-  }
-
-  return reply.send(result);
-});
-
-// GET /session/:id/status
-fastify.get("/session/:id/status", async (request, reply) => {
-  const { id } = request.params;
-  const status = sessionManager.getStatus(String(id));
-  if (!status) {
-    return reply.code(404).send({
-      success: false,
-      reason: "not_found",
-      sessionId: id,
-    });
-  }
-
-  return reply.send(status);
-});
-
-// GET /session
-fastify.get("/session", async (_request, reply) => {
-  const list = sessionManager.list();
-  return reply.send({
-    success: true,
-    count: list.length,
-    sessions: list,
-  });
-});
-
-// Simple JSON metrics endpoint
-fastify.get("/metrics", async (_request, reply) => {
-  return reply.send(buildMetricsSnapshot());
-});
-
-const PORT = Number(process.env.AFK_CORE_PORT || 4001);
-const HOST = process.env.AFK_CORE_HOST || "127.0.0.1";
-
-fastify
-  .listen({ port: PORT, host: HOST })
-  .then(() => {
-    fastify.log.info(
-      { port: PORT, host: HOST },
-      "AFK core service listening",
-    );
-  })
-  .catch((err) => {
-    fastify.log.error(err, "Failed to start AFK core service");
-    process.exit(1);
-  });
-
+module.exports = {
+  profiles,
+  getProfileForHost,
+  getProfileById,
+  hostHasFixedVersion,
+  getVersionForHost,
+};
