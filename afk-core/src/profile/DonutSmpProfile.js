@@ -1,10 +1,9 @@
 "use strict";
 
 const { BaseProfile } = require("./BaseProfile");
-const { HungerHandler } = require("../behavior/HungerHandler");
 
 /**
- * DonutSmpProfile
+ * DonutSmpProfile — mineflayer profile for DonutSMP.
  *
  * ALL DonutSMP-specific logic lives here:
  *   - Version: always 1.21.11, no auto-detection
@@ -13,7 +12,6 @@ const { HungerHandler } = require("../behavior/HungerHandler");
  *   - Packet logger: logs all inbound/outbound packets for debugging
  *   - Verification retry: handles EPIPE and socketClosed disconnects from
  *     DonutSMP's security check, retrying up to MAX_VERIFICATION_RETRIES times
- *   - Hunger management via HungerHandler
  */
 
 const DONUTSMP_VERSION = "1.21.11";
@@ -22,46 +20,17 @@ const VERIFICATION_RECONNECT_DELAY_MS = 5000;
 
 class DonutSmpProfile extends BaseProfile {
   constructor() {
-    super("donutsmp", [DONUTSMP_VERSION]);
-    this._hungerHandler = null;
+    super("donutsmp", DONUTSMP_VERSION);
   }
 
-  // ── Version ────────────────────────────────────────────────────────────────
-
-  /**
-   * Always returns the fixed DonutSMP version regardless of what was requested.
-   */
-  getVersion() {
-    return DONUTSMP_VERSION;
-  }
-
-  // ── buildClientOptions ─────────────────────────────────────────────────────
-
-  buildClientOptions(baseOptions, session) {
-    if (session) session.version = DONUTSMP_VERSION;
-    return {
-      ...baseOptions,
-      version: DONUTSMP_VERSION,
-      brand: "vanilla",
-      hideErrors: false,
-      skipValidation: false,
-    };
-  }
-
-  // ── attachHandlers ─────────────────────────────────────────────────────────
-
-  attachHandlers(client, session) {
-    const version = DONUTSMP_VERSION;
-    this._hungerHandler = new HungerHandler(version);
-    this._hungerHandler.attach(client);
-
-    // ── Movement block ───────────────────────────────────────────────────────
+  onBotCreated(bot, entry, botId, spawnBot) {
+    // ── Movement block ────────────────────────────────────────────────────────
     // Permanently suppress position/flying/look — an AFK bot never needs these.
     // Uses origWrite bypass so ping/pong can still go through.
-    const origWrite = client.write.bind(client);
+    const origWrite = bot._client.write.bind(bot._client);
     const BLOCKED = new Set(["position", "flying", "look"]);
 
-    client.write = function donutSmpMovementBlock(name, params) {
+    bot._client.write = function donutSmpMovementBlock(name, params) {
       if (BLOCKED.has(name)) {
         try {
           console.log(`[donut-pkt] → CLIENT sent: ${name} [SUPPRESSED]`, JSON.stringify(params).slice(0, 120));
@@ -78,10 +47,13 @@ class DonutSmpProfile extends BaseProfile {
       return origWrite(name, params);
     };
 
-    // ── Ping/pong ────────────────────────────────────────────────────────────
+    // Store origWrite on entry so ping/pong can use it even after the write override
+    entry._donutOrigWrite = origWrite;
+
+    // ── Ping/pong ─────────────────────────────────────────────────────────────
     // DonutSMP sends ping as a secondary liveness check. mineflayer/minecraft-
     // protocol does NOT auto-respond. Echo it back via origWrite (bypasses block).
-    client.on("ping", (packet) => {
+    bot._client.on("ping", (packet) => {
       try {
         origWrite("pong", { id: packet.id });
         console.log(`[donut-pkt] 🏓 ping id=${packet.id} → pong sent`);
@@ -90,8 +62,8 @@ class DonutSmpProfile extends BaseProfile {
       }
     });
 
-    // ── Inbound packet logger ────────────────────────────────────────────────
-    client.on("packet", (data, meta) => {
+    // ── Inbound packet logger ─────────────────────────────────────────────────
+    bot._client.on("packet", (data, meta) => {
       try {
         console.log(`[donut-pkt] ← SERVER: ${meta.name}`, JSON.stringify(data).slice(0, 120));
       } catch {
@@ -99,42 +71,56 @@ class DonutSmpProfile extends BaseProfile {
       }
     });
 
-    // ── Plugin message logger ────────────────────────────────────────────────
-    client.on("plugin_message", (packet) => {
+    // ── Plugin message logger ─────────────────────────────────────────────────
+    bot._client.on("plugin_message", (packet) => {
       const channel = packet?.channel || "unknown";
       const dataLen = packet?.data?.length ?? 0;
       console.log(`[DonutSmpProfile] plugin_message channel=${channel} bytes=${dataLen}`);
     });
 
-    // ── Login: record version in cache ───────────────────────────────────────
-    client.on("login", () => {
-      if (session) session.version = DONUTSMP_VERSION;
-    });
-
     console.log(`[DonutSmpProfile] ✅ Handlers attached — movement block + ping/pong active`);
   }
 
-  // ── tick ───────────────────────────────────────────────────────────────────
-
-  tick(session, client, nowMs) {
-    if (session.state !== "online") return;
-    if (this._hungerHandler) this._hungerHandler.tick(client);
+  onLogin(bot, entry, botId, spawnBot, callbacks) {
+    // DonutSMP: clear the outer spawn timeout only after verification window passes.
+    // The spawn timeout management is handled in botmanager based on profile.id === "donutsmp".
+    // Nothing extra needed here beyond the base login flow.
   }
 
-  // ── Verification retry logic ───────────────────────────────────────────────
+  onSpawn(bot, entry, botId) {}
 
-  /**
-   * Returns true if an error code looks like DonutSMP's security check
-   * closing the socket during the handshake.
-   */
+  onKick(bot, entry, botId, reasonText, spawnBot, autoMode, candidates, autoVersionState) {
+    if (DonutSmpProfile.isVerificationKick(reasonText)) {
+      DonutSmpProfile.scheduleVerificationRetry(entry, spawnBot, "kick");
+      return true;
+    }
+    return false;
+  }
+
+  onError(bot, entry, botId, err, spawnBot) {
+    if (DonutSmpProfile.isEpipe(err.code)) {
+      DonutSmpProfile.scheduleVerificationRetry(entry, spawnBot, "epipe");
+      return true;
+    }
+    return false;
+  }
+
+  onEnd(bot, entry, botId, reason, spawnBot) {
+    if (DonutSmpProfile.isVerificationDisconnect(reason, entry.connectedSince)) {
+      DonutSmpProfile.scheduleVerificationRetry(entry, spawnBot, "end");
+      return true;
+    }
+    return false;
+  }
+
+  onCleanup(botId) {}
+
+  // ── Static helpers ─────────────────────────────────────────────────────────
+
   static isEpipe(errCode) {
     return errCode === "EPIPE";
   }
 
-  /**
-   * Returns true if an end-reason looks like the DonutSMP verification disconnect.
-   * Covers pre-login (connectedSince === null) and post-login (< 30s online).
-   */
   static isVerificationDisconnect(reason, connectedSince) {
     if (!reason) return false;
     const r = (typeof reason === "string" ? reason : JSON.stringify(reason)).toLowerCase();
@@ -143,9 +129,6 @@ class DonutSmpProfile extends BaseProfile {
     return Math.floor((Date.now() - connectedSince) / 1000) < 30;
   }
 
-  /**
-   * Returns true if a kick reason text looks like a DonutSMP verification kick.
-   */
   static isVerificationKick(reasonText) {
     if (!reasonText) return false;
     const r = reasonText.toLowerCase();
@@ -157,10 +140,6 @@ class DonutSmpProfile extends BaseProfile {
     );
   }
 
-  /**
-   * Schedule a verification reconnect attempt, or give up if limit reached.
-   * Mutates entry directly. Calls spawnBot(version) after the delay.
-   */
   static scheduleVerificationRetry(entry, spawnBot, phase) {
     entry.donutSmpVerificationRetries = (entry.donutSmpVerificationRetries || 0) + 1;
 

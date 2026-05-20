@@ -6,14 +6,13 @@ const { BaseProfile } = require("./BaseProfile");
  * DefaultProfile — used for any server that doesn't match a specific profile.
  *
  * Behaviour:
- *   - Uses the version provided by the caller (or auto-detection)
+ *   - Version: "auto" (botmanager uses version cache / auto-detection)
  *   - Handles ping/pong for Paper servers
  *   - Sends client settings after login
  *   - No movement suppression
  */
 class DefaultProfile extends BaseProfile {
   constructor() {
-    // "auto" signals botmanager to use version auto-detection for this profile
     super("default", "auto");
   }
 
@@ -38,6 +37,22 @@ class DefaultProfile extends BaseProfile {
       try { onLinkVerified(entry.discordId, entry.minecraftUser); } catch (_) {}
     }
   }
+
+  onSpawn(bot, entry, botId) {}
+
+  onKick(bot, entry, botId, reasonText, spawnBot, autoMode, candidates, autoVersionState) {
+    return false; // let botmanager handle
+  }
+
+  onError(bot, entry, botId, err, spawnBot) {
+    return false; // let botmanager handle
+  }
+
+  onEnd(bot, entry, botId, reason, spawnBot) {
+    return false; // let botmanager handle
+  }
+
+  onCleanup(botId) {}
 }
 
 // ─── Shared utility ────────────────────────────────────────────────────────────

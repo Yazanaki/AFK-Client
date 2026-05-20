@@ -14,14 +14,14 @@
  *   3. That's it — botmanager and server.js pick it up automatically
  */
 
-const { DefaultProfile } = require("./DefaultProfile");
+const { DefaultProfile }  = require("./DefaultProfile");
 const { DonutSmpProfile } = require("./DonutSmpProfile");
 const { FreshSmpProfile } = require("./FreshSmpProfile");
-const { HypixelProfile } = require("./HypixelProfile");
+const { HypixelProfile }  = require("./HypixelProfile");
 
 // ─── Profile singletons ────────────────────────────────────────────────────────
-// We use singletons so that stateful profiles (e.g. FreshSmpProfile with its
-// pending gamemode map) are shared across the lifetime of the process.
+// Singletons ensure stateful profiles (e.g. FreshSmpProfile with its pending
+// gamemode map) share state across the lifetime of the process.
 
 const profiles = {
   default:  new DefaultProfile(),
@@ -35,11 +35,18 @@ const profiles = {
 // First match wins — put more specific patterns before generic ones.
 
 const HOST_PROFILES = [
-  { patterns: ["donutsmp.net", "donutsmp"],          profileId: "donutsmp" },
-  { patterns: ["freshsmp.net", "freshsmp",
-               "elementalmc.live",
-               "play.elementalmc.live"],             profileId: "freshsmp" },
-  { patterns: ["hypixel.net", "hypixel"],            profileId: "hypixel"  },
+  {
+    patterns:  ["donutsmp.net", "donutsmp"],
+    profileId: "donutsmp",
+  },
+  {
+    patterns:  ["freshsmp.net", "freshsmp", "elementalmc.live", "play.elementalmc.live"],
+    profileId: "freshsmp",
+  },
+  {
+    patterns:  ["hypixel.net", "hypixel"],
+    profileId: "hypixel",
+  },
 ];
 
 // ─── Public API ────────────────────────────────────────────────────────────────
@@ -54,7 +61,7 @@ function getProfileForHost(host) {
   const lower = String(host || "").toLowerCase();
 
   for (const { patterns, profileId } of HOST_PROFILES) {
-    if (patterns.some((p) => lower.includes(p))) {
+    if (patterns.some((p) => lower.includes(p.toLowerCase()))) {
       return profiles[profileId];
     }
   }
@@ -75,7 +82,6 @@ function getProfileById(id) {
 
 /**
  * Check whether a hostname maps to a profile with a fixed (non-auto) version.
- * If true, callers should use profile.version directly rather than auto-detecting.
  *
  * @param {string} host
  * @returns {boolean}
@@ -87,15 +93,14 @@ function hostHasFixedVersion(host) {
 
 /**
  * Return the version string botmanager should use for this host.
- * If the profile has a fixed version, returns that.
- * Otherwise returns "auto" to trigger version auto-detection in botmanager.
+ * "auto" triggers version auto-detection in botmanager.
  *
  * @param {string} host
  * @returns {string}
  */
 function getVersionForHost(host) {
   const profile = getProfileForHost(host);
-  return profile.version; // "auto" for DefaultProfile, fixed string for others
+  return profile.version;
 }
 
 module.exports = {

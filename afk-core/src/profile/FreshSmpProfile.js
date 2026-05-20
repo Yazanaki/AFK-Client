@@ -1,15 +1,13 @@
 "use strict";
 
 const { BaseProfile } = require("./BaseProfile");
-const { HungerHandler } = require("../behavior/HungerHandler");
 
 /**
- * FreshSmpProfile
+ * FreshSmpProfile — mineflayer profile for FreshSMP / ElementalMC.
  *
  * ALL FreshSMP-specific logic lives here:
  *   - Version: always 1.21.11
- *   - Ping/pong handling
- *   - Hunger management via HungerHandler
+ *   - Ping/pong handling (Paper server)
  *   - Gamemode queue flow: waits for Discord user to pick a gamemode,
  *     then sends /queue <gamemode> after a stabilisation delay
  */
@@ -19,74 +17,56 @@ const QUEUE_COMMAND_DELAY_MS = 2000;
 const GAMEMODE_SELECTION_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 
 const FRESHSMP_GAMEMODES = {
-  survival: "survival",
+  survival:  "survival",
   lifesteal: "lifesteal",
-  skywars: "skywars",
+  skywars:   "skywars",
 };
 
 class FreshSmpProfile extends BaseProfile {
   constructor() {
-    super("freshsmp", [FRESHSMP_VERSION]);
-    this._hungerHandler = null;
+    super("freshsmp", FRESHSMP_VERSION);
     // Map<botId, { resolve, timer }> — pending gamemode selections
     this._pendingGamemode = new Map();
   }
 
-  // ── Version ────────────────────────────────────────────────────────────────
-
-  getVersion() {
-    return FRESHSMP_VERSION;
-  }
-
-  // ── buildClientOptions ─────────────────────────────────────────────────────
-
-  buildClientOptions(baseOptions, session) {
-    if (session) session.version = FRESHSMP_VERSION;
-    return {
-      ...baseOptions,
-      version: FRESHSMP_VERSION,
-      brand: "vanilla",
-    };
-  }
-
-  // ── attachHandlers ─────────────────────────────────────────────────────────
-
-  attachHandlers(client, session) {
-    const version = FRESHSMP_VERSION;
-    this._hungerHandler = new HungerHandler(version);
-    this._hungerHandler.attach(client);
-
+  onBotCreated(bot, entry, botId, spawnBot) {
     // FreshSMP runs on Paper — handle ping/pong
-    client.on("ping", (packet) => {
+    bot._client.on("ping", (packet) => {
       try {
-        client.write("pong", { id: packet.id });
+        bot._client.write("pong", { id: packet.id });
       } catch (_) {}
     });
+  }
 
-    client.on("plugin_message", () => {
-      // Future: inspect FreshSMP-specific plugin channels if needed
+  onLogin(bot, entry, botId, spawnBot, callbacks) {
+    const { onFreshSmpSpawned } = callbacks || {};
+
+    // Kick off the async gamemode selection flow — fire-and-forget
+    this.runGamemodeFlow(botId, entry, bot, onFreshSmpSpawned).catch((err) => {
+      console.warn(`[FreshSmpProfile] ⚠️ runGamemodeFlow error for ${entry.minecraftUser}:`, err.message);
     });
   }
 
-  // ── tick ───────────────────────────────────────────────────────────────────
+  onSpawn(bot, entry, botId) {}
 
-  tick(session, client, nowMs) {
-    if (session.state !== "online") return;
-    if (this._hungerHandler) this._hungerHandler.tick(client);
+  onKick(bot, entry, botId, reasonText, spawnBot, autoMode, candidates, autoVersionState) {
+    return false;
+  }
+
+  onError(bot, entry, botId, err, spawnBot) {
+    return false;
+  }
+
+  onEnd(bot, entry, botId, reason, spawnBot) {
+    return false;
+  }
+
+  onCleanup(botId) {
+    this.cancelPendingGamemode(botId);
   }
 
   // ── Gamemode queue flow ────────────────────────────────────────────────────
 
-  /**
-   * Called by botmanager after login to kick off the gamemode selection flow.
-   * Fires onFreshSmpSpawned so the Discord bot can show the selector embed,
-   * then waits for selectGamemode() to be called before sending /queue.
-   *
-   * @param {string}   botId
-   * @param {object}   entry        - botmanager registry entry
-   * @param {object}   bot          - mineflayer bot instance
-   * @param {Function} onFreshSmpSpawned
-   */
   async runGamemodeFlow(botId, entry, bot, onFreshSmpSpawned) {
     if (typeof onFreshSmpSpawned === "function") {
       try { onFreshSmpSpawned(botId); }
@@ -123,10 +103,6 @@ class FreshSmpProfile extends BaseProfile {
     }
   }
 
-  /**
-   * Resolve the pending gamemode promise for a bot.
-   * Called when the Discord user clicks a gamemode button.
-   */
   selectGamemode(botId, gamemode) {
     const key = String(gamemode || "").toLowerCase();
     const queueArg = FRESHSMP_GAMEMODES[key];
@@ -144,9 +120,6 @@ class FreshSmpProfile extends BaseProfile {
     return { success: false, reason: "no_pending_selection" };
   }
 
-  /**
-   * Send /queue directly when there's no pending promise (re-queue scenario).
-   */
   sendQueueCommand(activeBots, botId, gamemode) {
     const key = String(gamemode || "").toLowerCase();
     const queueArg = FRESHSMP_GAMEMODES[key];
@@ -168,9 +141,6 @@ class FreshSmpProfile extends BaseProfile {
     }
   }
 
-  /**
-   * Cancel any pending gamemode wait for a bot (called on disconnect/cleanup).
-   */
   cancelPendingGamemode(botId) {
     const pending = this._pendingGamemode.get(botId);
     if (pending) {
@@ -178,8 +148,6 @@ class FreshSmpProfile extends BaseProfile {
       this._pendingGamemode.delete(botId);
     }
   }
-
-  // ── Private ────────────────────────────────────────────────────────────────
 
   _waitForGamemode(botId) {
     return new Promise((resolve, reject) => {
