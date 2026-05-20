@@ -1,7 +1,7 @@
 "use strict";
 
 /**
- * profiles/index.js — Profile Registry
+ * afk-core/src/index.js — Profile Registry
  *
  * Single source of truth for:
  *   1. Which host patterns map to which profile
@@ -9,20 +9,17 @@
  *   3. Profile instance singletons (one per profile type)
  *
  * To add a new server:
- *   1. Create profiles/YourServerProfile.js extending BaseProfile
+ *   1. Create a profile file in this directory extending BaseProfile
  *   2. Add an entry to HOST_PROFILES below
  *   3. That's it — botmanager and server.js pick it up automatically
  */
 
-const { DefaultProfile }  = require("./DefaultProfile");
-const { DonutSmpProfile } = require("./DonutSmpProfile");
-const { FreshSmpProfile } = require("./FreshSmpProfile");
-const { HypixelProfile }  = require("./HypixelProfile");
+const { DefaultProfile }  = require("./profile/DefaultProfile");
+const { DonutSmpProfile } = require("./profile/DonutSmpProfile");
+const { FreshSmpProfile } = require("./profile/FreshSmpProfile");
+const { HypixelProfile }  = require("./profile/HypixelProfile");
 
 // ─── Profile singletons ────────────────────────────────────────────────────────
-// Singletons ensure stateful profiles (e.g. FreshSmpProfile with its pending
-// gamemode map) share state across the lifetime of the process.
-
 const profiles = {
   default:  new DefaultProfile(),
   donutsmp: new DonutSmpProfile(),
@@ -31,9 +28,6 @@ const profiles = {
 };
 
 // ─── Host pattern → profile mapping ───────────────────────────────────────────
-// Patterns are matched case-insensitively against the server hostname.
-// First match wins — put more specific patterns before generic ones.
-
 const HOST_PROFILES = [
   {
     patterns:  ["donutsmp.net", "donutsmp"],
@@ -47,60 +41,32 @@ const HOST_PROFILES = [
     patterns:  ["hypixel.net", "hypixel"],
     profileId: "hypixel",
   },
+  {
+    patterns:  ["minehut.com", "minehut", "korraemc"],
+    profileId: "minehut",
+  },
 ];
 
-// ─── Public API ────────────────────────────────────────────────────────────────
-
-/**
- * Resolve which profile to use for a given server host.
- *
- * @param {string} host - server hostname (e.g. "mc.donutsmp.net")
- * @returns {BaseProfile} - the matching profile, or DefaultProfile if none matches
- */
 function getProfileForHost(host) {
   const lower = String(host || "").toLowerCase();
-
   for (const { patterns, profileId } of HOST_PROFILES) {
     if (patterns.some((p) => lower.includes(p.toLowerCase()))) {
       return profiles[profileId];
     }
   }
-
   return profiles.default;
 }
 
-/**
- * Get a profile by its explicit ID string.
- * Returns DefaultProfile if the ID is unknown.
- *
- * @param {string} id
- * @returns {BaseProfile}
- */
 function getProfileById(id) {
   return profiles[String(id || "").toLowerCase()] || profiles.default;
 }
 
-/**
- * Check whether a hostname maps to a profile with a fixed (non-auto) version.
- *
- * @param {string} host
- * @returns {boolean}
- */
 function hostHasFixedVersion(host) {
-  const profile = getProfileForHost(host);
-  return profile.version !== "auto";
+  return getProfileForHost(host).version !== "auto";
 }
 
-/**
- * Return the version string botmanager should use for this host.
- * "auto" triggers version auto-detection in botmanager.
- *
- * @param {string} host
- * @returns {string}
- */
 function getVersionForHost(host) {
-  const profile = getProfileForHost(host);
-  return profile.version;
+  return getProfileForHost(host).version;
 }
 
 module.exports = {

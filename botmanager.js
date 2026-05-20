@@ -11,7 +11,7 @@ const mineflayer = require("mineflayer");
 const fs = require("fs");
 const path = require("path");
 
-const { getProfileForHost } = require("./profiles/index");
+const { getProfileForHost } = require("./afk-core/src/index");
 
 // ============================================================
 // TOKEN CACHE — persists Microsoft tokens between restarts
@@ -972,23 +972,10 @@ function _entryToStatus(entry) {
 
 // ============================================================
 // PROFILE-SPECIFIC PASS-THROUGHS
-//
-// Server.js needs to call methods on specific profiles (e.g.
-// FreshSmpProfile.selectGamemode). Rather than importing profiles
-// directly in server.js, botmanager exposes thin wrappers so that
-// server.js remains free of profile-specific imports.
 // ============================================================
 
-/**
- * Attempt to resolve a FreshSMP gamemode selection for a bot.
- * Tries the pending-promise path first, falls back to a direct chat command.
- *
- * @param {string} botId
- * @param {string} gamemode
- * @returns {{ success: boolean, gamemode?: string, reason?: string }}
- */
 function sendFreshSmpQueueCommand(botId, gamemode) {
-  const { profiles } = require("./profiles/index");
+  const { profiles } = require("./afk-core/src/index");
   const freshSmpProfile = profiles.freshsmp;
 
   // Try resolving the pending selection promise first
