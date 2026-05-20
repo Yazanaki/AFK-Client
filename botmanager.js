@@ -136,6 +136,22 @@ const activeBots = new Map();
 // ============================================================
 const recentlyEndedBots = [];
 
+// ============================================================
+// FRESHSMP: pending gamemode selections
+// Map<botId, { resolve: Function, timer: NodeJS.Timeout }>
+// When the Discord bot POSTs a gamemode selection, we resolve
+// the pending promise so the bot can send the /queue command.
+// ============================================================
+const pendingFreshSmpGamemode = new Map();
+const FRESHSMP_GAMEMODE_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes to pick a gamemode
+
+// Valid FreshSMP gamemodes and their /queue argument
+const FRESHSMP_GAMEMODES = {
+  survival: "survival",
+  lifesteal: "lifesteal",
+  skywars: "skywars",
+};
+
 function recordEndedBot(entry, endReason) {
   // Don't notify for manual stops
   if (endReason === "manual_stop" || endReason === "stopall" || endReason === "stop_user_all") return;
@@ -173,30 +189,41 @@ const RECONNECT_DELAY_MS = parseInt(process.env.RECONNECT_DELAY_MS || "5000", 10
 const MAX_BOTS = parseInt(process.env.MAX_BOTS || "0", 10); // 0 = unlimited
 
 // ============================================================
-// DONUTSMP VERIFICATION RECONNECT SETTINGS
+// KEEP-ALIVE TIMEOUT SETTINGS
 //
-// DonutSMP closes the connection at multiple points during its
-// security verification flow:
+// Root cause of the ~1hr timeout kick:
+//   mineflayer's checkTimeoutInterval defaults to 30s, which races
+//   with DonutSMP's server-side 30s keep-alive timeout window.
+//   If there's any processing delay on either end, we lose the race
+//   and get kicked with "disconnect.timeout".
 //
-//   1. EPIPE — server closes socket during handshake/login phase
-//              before our bot can even finish writing its first packets.
-//   2. socketClosed (pre-login)  — TCP closed before `login` fires.
-//   3. socketClosed (post-login) — TCP closed shortly after `login`
-//              fires (verification screen shown, bot not confirmed yet).
-//
-// All three are treated as verification-related and retried silently
-// using the same counter.
+// FIX: Set checkTimeoutInterval to 10s so mineflayer checks and
+//   responds to keep-alive packets well within the server's window.
+//   Also explicitly handle the `ping` packet (a separate mechanism
+//   from `keep_alive` that some Paper servers use) by echoing it
+//   back immediately via `pong`.
+// ============================================================
+const CHECK_TIMEOUT_INTERVAL_MS = 10 * 1000; // 10s — respond to keep-alives fast
+
+// ============================================================
+// DONUTSMP SETTINGS
 // ============================================================
 const DONUTSMP_HOST_PATTERNS = ["donutsmp.net", "donutsmp"];
 // How many total retries before giving up
 const DONUTSMP_MAX_VERIFICATION_RETRIES = 10;
-// Delay between retries — give DonutSMP time to process verification state
-const DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS = 10000; // 10 seconds
+const DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS = 5000;
+const DONUTSMP_STRICT_VERSION = "1.21.11";
 
 function isDonutSmpHost(host) {
   if (!host) return false;
   const lower = host.toLowerCase();
   return DONUTSMP_HOST_PATTERNS.some(p => lower.includes(p));
+}
+
+function isFreshSmpHost(host) {
+  if (!host) return false;
+  const lower = host.toLowerCase();
+  return FRESHSMP_HOST_PATTERNS.some(p => lower.includes(p));
 }
 
 /**
@@ -476,83 +503,148 @@ function makeBotId(discordId, minecraftUser) {
   return `${discordId}:${minecraftUser.toLowerCase()}`;
 }
 
-// ============================================================
-// HARD DESTROY a mineflayer bot instance
-//
-// mineflayer's bot.quit() sends a disconnect packet then calls bot.end().
-// bot.end() closes the underlying _client (minecraft-protocol client).
-// However neither guarantees the TCP socket is destroyed immediately,
-// and mineflayer keeps its internal keepalive timer running until the
-// socket fully closes — which can cause "timed out" errors on zombie
-// instances.
-//
-// We go a layer deeper: after quit/end we also destroy the raw socket
-// and remove all event listeners so no further events can fire.
-// ============================================================
-function hardDestroyBot(bot) {
-  if (!bot) return;
-
-  // 1. Stop mineflayer's internal keepalive timer by removing all listeners
-  //    before calling end, so no "timed out" error event fires after cleanup.
-  try { bot.removeAllListeners(); } catch (_) {}
-
-  // 2. Silence the underlying minecraft-protocol client listeners too
-  try { if (bot._client) bot._client.removeAllListeners(); } catch (_) {}
-
-  // 3. Destroy the raw TCP socket — this is the critical step that stops
-  //    minecraft-protocol's keepalive.js timeout from firing.
+function sendClientSettings(bot, username, context) {
+  const ctx = context || "unknown";
+  console.log(`[botmanager] 📋 [${username}] Sending client settings (context: ${ctx})`);
   try {
-    if (bot._client && bot._client.socket) {
-      bot._client.socket.destroy();
-    }
-  } catch (_) {}
-
-  // 4. Standard graceful close as a best-effort cleanup
-  try { bot.quit(); } catch (_) {}
-  try { bot.end(); } catch (_) {}
-}
-
-// ============================================================
-// DONUTSMP VERIFICATION RETRY HELPER
-//
-// Central place to schedule a DonutSMP verification retry so the
-// same logic isn't duplicated across the error and end handlers.
-// Returns true if a retry was scheduled, false if retries exhausted.
-// ============================================================
-function scheduleDonutSmpRetry(botId, entry, spawnBotFn, phase) {
-  if (entry.donutSmpVerificationRetries < DONUTSMP_MAX_VERIFICATION_RETRIES) {
-    entry.donutSmpVerificationRetries++;
-    console.log(
-      `[botmanager] 🟠 DonutSMP verification disconnect (${phase}) for ${entry.minecraftUser} ` +
-      `(attempt ${entry.donutSmpVerificationRetries}/${DONUTSMP_MAX_VERIFICATION_RETRIES}) — reconnecting in ${DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS}ms`
-    );
-    entry.status = "reconnecting";
-    entry.spawnError = null;
-    setTimeout(() => {
-      if (!activeBots.has(botId)) return;
-      spawnBotFn(entry.version);
-    }, DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS);
-    return true;
-  } else {
-    console.warn(
-      `[botmanager] 🟠 DonutSMP verification retries exhausted for ${entry.minecraftUser} — reporting error to user`
-    );
-    entry.status = "error";
-    entry.spawnError =
-      "DonutSMP is requiring account verification before allowing you to join. " +
-      "Please log into DonutSMP manually once to complete the verification process, " +
-      "then try /mcbot start again.";
-    entry.errorCategory = "donutsmp_verification";
-    cleanupBot(botId, "donutsmp_verification_failed");
-    return false;
+    bot._client.write("settings", {
+      locale: "en_US", viewDistance: 8, chatFlags: 0, chatColors: true,
+      skinParts: 127, mainHand: 1, enableTextFiltering: false, enableServerListing: true,
+    });
+    console.log(`[botmanager] 📋 [${username}] Client settings sent successfully`);
+  } catch (err) {
+    console.warn(`[botmanager] ⚠️ [${username}] Could not send client settings:`, err.message);
   }
 }
 
 // ============================================================
-// START BOT
+// DONUTSMP MOVEMENT SUPPRESSION
+//
+// Permanently block autonomous position/flying/look packets for the
+// entire session. An AFK bot has no reason to send them at all.
+//   - `position`      = autonomous heartbeat (BLOCK FOREVER)
+//   - `flying`        = on-ground heartbeat (BLOCK FOREVER)
+//   - `look`          = head rotation (BLOCK FOREVER)
+//   - `position_look` = teleport echo response (ALWAYS ALLOW)
+// All other packets pass freely.
 // ============================================================
+function installDonutSmpMovementBlock(bot, entry, botId, minecraftUser) {
+  entry.donutSmpReadyAt = 0;
 
-function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode = null, onLinkVerified = null) {
+  if (bot.physicsEnabled !== undefined) {
+    bot.physicsEnabled = false;
+  }
+
+  const origWrite = bot._client.write.bind(bot._client);
+  const BLOCK = new Set(["position", "flying", "look"]);
+
+  bot._client.write = function donutSmpMovementBlock(name, params) {
+    if (BLOCK.has(name)) {
+      try {
+        const preview = JSON.stringify(params);
+        console.log(`[donut-pkt] → CLIENT sent: ${name} [SUPPRESSED]`, (preview != null ? preview : "(non-serializable)").slice(0, 120));
+      } catch {
+        console.log(`[donut-pkt] → CLIENT sent: ${name} [SUPPRESSED] (non-serializable)`);
+      }
+      return;
+    }
+    try {
+      const preview = JSON.stringify(params);
+      console.log(`[donut-pkt] → CLIENT sent: ${name}`, (preview != null ? preview : "(non-serializable)").slice(0, 120));
+    } catch {
+      console.log(`[donut-pkt] → CLIENT sent: ${name} (non-serializable)`);
+    }
+    return origWrite(name, params);
+  };
+
+  // ── Explicit ping/pong handler ──────────────────────────────────────────
+  // Some Paper servers (including DonutSMP) send a `ping` packet as an
+  // additional liveness check separate from `keep_alive`. mineflayer does
+  // NOT automatically respond to this. If we don't pong, the server's
+  // connection watchdog eventually kicks us with disconnect.timeout.
+  //
+  // We listen on the raw _client for the `ping` packet and immediately
+  // write back a `pong` with the same id. This runs outside the movement
+  // block since `pong` is not in the BLOCK set.
+  bot._client.on("ping", (packet) => {
+    try {
+      origWrite("pong", { id: packet.id });
+      console.log(`[donut-pkt] 🏓 ping received id=${packet.id} → pong sent`);
+    } catch (err) {
+      console.warn(`[botmanager] ⚠️ [${minecraftUser}] Could not send pong:`, err.message);
+    }
+  });
+
+  console.log(
+    `[botmanager] 🟠 [${minecraftUser}] DonutSMP movement block + ping/pong handler installed — ` +
+    `position/flying/look permanently suppressed`
+  );
+}
+
+// ============================================================
+// FRESHSMP: Send gamemode queue command
+// ============================================================
+function sendFreshSmpQueueCommand(botId, gamemode) {
+  const entry = activeBots.get(botId);
+  if (!entry) {
+    console.warn(`[botmanager] ⚠️ [FreshSMP] sendFreshSmpQueueCommand: bot ${botId} not found`);
+    return { success: false, reason: "bot_not_found" };
+  }
+
+  if (!entry.bot) {
+    console.warn(`[botmanager] ⚠️ [FreshSMP] sendFreshSmpQueueCommand: bot instance missing for ${botId}`);
+    return { success: false, reason: "bot_instance_missing" };
+  }
+
+  if (entry.status !== "online") {
+    console.warn(`[botmanager] ⚠️ [FreshSMP] sendFreshSmpQueueCommand: bot ${botId} is not online (status: ${entry.status})`);
+    return { success: false, reason: "bot_not_online" };
+  }
+
+  const gamemodeKey = String(gamemode || "").toLowerCase();
+  const queueArg = FRESHSMP_GAMEMODES[gamemodeKey];
+  if (!queueArg) {
+    console.warn(`[botmanager] ⚠️ [FreshSMP] Unknown gamemode: ${gamemode}`);
+    return { success: false, reason: "unknown_gamemode" };
+  }
+
+  // Resolve the pending gamemode promise if one exists (from the spawn wait)
+  const pending = pendingFreshSmpGamemode.get(botId);
+  if (pending) {
+    clearTimeout(pending.timer);
+    pendingFreshSmpGamemode.delete(botId);
+    pending.resolve(queueArg);
+    console.log(`[botmanager] 🎮 [FreshSMP] Gamemode resolved via pending promise for ${botId}: /${queueArg}`);
+    return { success: true, gamemode: queueArg };
+  }
+
+  // No pending promise — send command directly (e.g. called after timeout or re-queue)
+  try {
+    entry.bot.chat(`/queue ${queueArg}`);
+    entry.freshSmpGamemode = queueArg;
+    console.log(`[botmanager] 🎮 [FreshSMP] Sent /queue ${queueArg} for ${entry.minecraftUser}`);
+    return { success: true, gamemode: queueArg };
+  } catch (err) {
+    console.error(`[botmanager] ❌ [FreshSMP] Failed to send /queue ${queueArg} for ${entry.minecraftUser}:`, err.message);
+    return { success: false, reason: "chat_failed", error: err.message };
+  }
+}
+
+// ============================================================
+// FRESHSMP: Wait for gamemode selection
+// ============================================================
+function waitForFreshSmpGamemode(botId) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pendingFreshSmpGamemode.delete(botId);
+      reject(new Error("gamemode_selection_timeout"));
+    }, FRESHSMP_GAMEMODE_TIMEOUT_MS);
+
+    pendingFreshSmpGamemode.set(botId, { resolve, timer });
+  });
+}
+
+function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode = null, onLinkVerified = null, onFreshSmpSpawned = null) {
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
   console.log(`[botmanager] 🤖 Starting bot`);
   console.log(`  Discord ID:   ${discordId}`);
@@ -597,6 +689,11 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
   // Track whether this is a DonutSMP server for special reconnect handling
   const isDonutSmp = isDonutSmpHost(hostLower);
 
+  if (isDonutSmp && effectiveVersion !== DONUTSMP_STRICT_VERSION) {
+    console.warn(`[botmanager] 🛡️ DonutSMP strict version override: ${effectiveVersion} -> ${DONUTSMP_STRICT_VERSION}`);
+    effectiveVersion = DONUTSMP_STRICT_VERSION;
+  }
+
   const entry = {
     botId,
     discordId,
@@ -605,16 +702,11 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     serverPort: port,
     version: effectiveVersion,
     startedAt: new Date().toISOString(),
-    status: "connecting",
-    spawnError: null,
-    spawnTimeoutId: null,
-    deviceCodeEmitted: false,
-    bot: null,
-    // DonutSMP verification retry tracking
-    // Counts ALL retries regardless of whether login fired
-    isDonutSmp,
-    donutSmpVerificationRetries: 0,
-    connectedSince: null, // set when login fires; null = pre-login
+    status: "connecting", spawnError: null, spawnTimeoutId: null,
+    deviceCodeEmitted: false, bot: null, isDonutSmp,
+    donutSmpVerificationRetries: 0, connectedSince: null,
+    donutSmpQuietUntil: 0,
+    donutSmpReadyAt: 0,
   };
 
   activeBots.set(botId, entry);
@@ -623,12 +715,7 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
   let isEating = false;
   let eatCooldownUntil = 0;
 
-  // ── Initial spawn timeout ──────────────────────────────────
-  // For DonutSMP we give much more time because the verification
-  // retry loop can take several minutes before the bot gets through.
-  const initialSpawnTimeoutMs = isDonutSmp
-    ? (DONUTSMP_MAX_VERIFICATION_RETRIES * (DONUTSMP_VERIFICATION_RECONNECT_DELAY_MS + 5000)) + 30000
-    : 30000;
+  const initialSpawnTimeoutMs = isDonutSmp ? 90000 : 30000;
 
   entry.spawnTimeoutId = setTimeout(() => {
     if (!activeBots.has(botId)) return;
@@ -637,7 +724,7 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
     if (e.deviceCodeEmitted) return; // auth timeout handled separately
     console.warn(`[botmanager] ⏰ Spawn timeout for ${minecraftUser} after ${Math.round(initialSpawnTimeoutMs / 1000)}s — cleaning up`);
     e.spawnError = isDonutSmp
-      ? "DonutSMP is requiring account verification before allowing you to join. Please log into DonutSMP manually once to complete the verification process, then try /mcbot start again."
+      ? "DonutSMP security check timed out. Please confirm the login via the DonutSMP Discord bot DM, then try /mcbot start again."
       : "Bot failed to connect within 30 seconds. The server may be offline or unreachable.";
     e.status = "error";
     if (isDonutSmp) e.errorCategory = "donutsmp_verification";
@@ -668,6 +755,10 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
         auth: "microsoft",
         profilesFolder: tokenDir,
         onMsaCode: (data) => handleDeviceCode(minecraftUser, onDeviceCode, data, botId),
+        // Use a shorter check interval so we respond to keep-alive packets
+        // well within the server's timeout window (DonutSMP kicks at 30s).
+        // 10s gives us 3x margin before the server would time us out.
+        checkTimeoutInterval: CHECK_TIMEOUT_INTERVAL_MS,
       });
     } catch (err) {
       console.error(`[botmanager] ❌ mineflayer.createBot threw for ${minecraftUser}:`, err.message);
@@ -749,7 +840,22 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       saveToken(minecraftUser);
 
       if (isDonutSmp) {
-        console.log(`[botmanager] 🟠 DonutSMP login detected — monitoring for verification screen disconnect (retry ${e.donutSmpVerificationRetries}/${DONUTSMP_MAX_VERIFICATION_RETRIES})`);
+        // Install movement block AND ping/pong handler.
+        installDonutSmpMovementBlock(bot, e, botId, minecraftUser);
+        console.log(`[botmanager] 🟠 DonutSMP login — movement block + ping/pong active. Monitoring for verification disconnect (retry ${e.donutSmpVerificationRetries}/${DONUTSMP_MAX_VERIFICATION_RETRIES})`);
+      } else {
+        // For non-DonutSMP servers, also handle ping/pong since some Paper
+        // servers use it regardless of anti-cheat configuration.
+        bot._client.on("ping", (packet) => {
+          try {
+            bot._client.write("pong", { id: packet.id });
+          } catch (_) {}
+        });
+
+        setTimeout(() => {
+          if (!activeBots.has(botId) || entry.bot !== bot) return;
+          sendClientSettings(bot, minecraftUser, "post-login");
+        }, 1000);
       }
 
       if (typeof onLinkVerified === "function") {
@@ -757,10 +863,39 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       }
     });
 
+    // ── DonutSMP: Full packet logger ─────────────────────────────────────────
+    if (isDonutSmp) {
+      bot._client.on("packet", (data, meta) => {
+        try {
+          const serialized = JSON.stringify(data);
+          const preview = (serialized != null) ? serialized.slice(0, 120) : "(non-serializable)";
+          console.log(`[donut-pkt] ← SERVER sent: ${meta.name}`, preview);
+        } catch {
+          console.log(`[donut-pkt] ← SERVER sent: ${meta.name} (binary/non-serializable)`);
+        }
+      });
+    }
+
+    // ── Spawn ─────────────────────────────────────────────────────────────────
+    bot.once("spawn", () => {
+      if (!activeBots.has(botId)) return;
+      if (isDonutSmp) console.log(`[botmanager] 🟠 DonutSMP spawn fired for ${minecraftUser} — movement block active`);
+    });
+
+    // ── Kicked ───────────────────────────────────────────────────────────────
     bot.on("kicked", (reason) => {
       if (!isCurrentBot()) return;
       const reasonText = typeof reason === "string" ? reason : JSON.stringify(reason);
       console.warn(`[botmanager] 🦵 Bot kicked (${minecraftUser}): ${reasonText}`);
+      const e = activeBots.get(botId);
+      if (entry.bot !== bot) return;
+      if (e.status === "reconnecting" && !e.isDonutSmp) return;
+
+      if (e.isDonutSmp && isDonutSmpVerificationKick(reasonText)) {
+        console.log(`[botmanager] 🟠 DonutSMP verification kick for ${minecraftUser} — scheduling retry`);
+        kickHandled = true;
+        return;
+      }
 
       if (autoMode && shouldRotateVersionForReason(reasonText)) {
         autoVersionIndex++;
@@ -807,6 +942,15 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
       }
 
       console.error(`[botmanager] ❌ Bot error (${minecraftUser}):`, errMessage);
+
+      // Cancel any pending FreshSMP gamemode wait
+      if (isFreshSmp) {
+        const pending = pendingFreshSmpGamemode.get(botId);
+        if (pending) {
+          clearTimeout(pending.timer);
+          pendingFreshSmpGamemode.delete(botId);
+        }
+      }
 
       // ── Auth error dedup ───────────────────────────────────────────────
       const isAuthError =
@@ -870,6 +1014,15 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
 
       console.log(`[botmanager] 🔌 Bot disconnected (${minecraftUser}): ${reason}`);
 
+      // Cancel any pending FreshSMP gamemode wait
+      if (isFreshSmp) {
+        const pending = pendingFreshSmpGamemode.get(botId);
+        if (pending) {
+          clearTimeout(pending.timer);
+          pendingFreshSmpGamemode.delete(botId);
+        }
+      }
+
       // ── DonutSMP verification screen handling ──────────────────────────
       // Handles BOTH pre-login (connectedSince === null) and post-login
       // (connectedSince set, online < 30s) socketClosed disconnects.
@@ -904,6 +1057,61 @@ function startBot(discordId, minecraftUser, serverAddress, version, onDeviceCode
 }
 
 // ============================================================
+// FRESHSMP GAMEMODE FLOW (async, fires after login)
+//
+// 1. Calls onFreshSmpSpawned so the Discord bot knows the bot
+//    is online and can DM the gamemode selector embed.
+// 2. Waits for the user to click a button (resolves the pending
+//    promise via sendFreshSmpQueueCommand / waitForFreshSmpGamemode).
+// 3. Sends /queue <gamemode> after a short stabilisation delay.
+// 4. Marks freshSmpQueueSent on the entry so the status embed
+//    can reflect which gamemode the bot is in.
+// ============================================================
+async function _handleFreshSmpGamemodeFlow(botId, minecraftUser, bot, onFreshSmpSpawned) {
+  // Notify the Discord bot that we're online and need a gamemode selection
+  if (typeof onFreshSmpSpawned === "function") {
+    try { onFreshSmpSpawned(botId); }
+    catch (err) { console.warn(`[botmanager] ⚠️ [FreshSMP] onFreshSmpSpawned callback threw:`, err.message); }
+  }
+
+  let chosenGamemode;
+  try {
+    console.log(`[botmanager] 🟢 [FreshSMP] Waiting for gamemode selection for ${minecraftUser}...`);
+    chosenGamemode = await waitForFreshSmpGamemode(botId);
+  } catch (err) {
+    // Timed out — bot stays connected but /queue was never sent
+    console.warn(`[botmanager] ⚠️ [FreshSMP] Gamemode selection timed out for ${minecraftUser}. Bot remains connected but /queue not sent.`);
+    return;
+  }
+
+  // Check the bot is still active before sending
+  if (!activeBots.has(botId)) {
+    console.warn(`[botmanager] ⚠️ [FreshSMP] Bot ${botId} gone before /queue could be sent`);
+    return;
+  }
+
+  const entry = activeBots.get(botId);
+  if (entry.bot !== bot || entry.status !== "online") {
+    console.warn(`[botmanager] ⚠️ [FreshSMP] Bot ${botId} no longer online, skipping /queue`);
+    return;
+  }
+
+  // Short delay to let the server fully stabilise after login
+  await new Promise(r => setTimeout(r, FRESHSMP_QUEUE_COMMAND_DELAY_MS));
+
+  if (!activeBots.has(botId) || activeBots.get(botId).bot !== bot) return;
+
+  try {
+    bot.chat(`/queue ${chosenGamemode}`);
+    entry.freshSmpGamemode = chosenGamemode;
+    entry.freshSmpQueueSent = true;
+    console.log(`[botmanager] 🟢 [FreshSMP] Sent /queue ${chosenGamemode} for ${minecraftUser}`);
+  } catch (err) {
+    console.error(`[botmanager] ❌ [FreshSMP] Failed to send /queue ${chosenGamemode} for ${minecraftUser}:`, err.message);
+  }
+}
+
+// ============================================================
 // STOP / CLEANUP
 // ============================================================
 
@@ -921,7 +1129,6 @@ function stopBot(discordId, minecraftUser) {
     console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
     return { success: false, reason: "no_bot_running" };
   }
-
   cleanupBot(botId, "manual_stop");
   console.log(`[botmanager] ✅ Bot stopped for ${minecraftUser}`);
   console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
@@ -936,10 +1143,7 @@ function stopBotsForUser(discordId) {
   const prefix = `${discordId}:`;
   let count = 0;
   for (const botId of [...activeBots.keys()]) {
-    if (botId.startsWith(prefix)) {
-      cleanupBot(botId, "stop_user_all");
-      count++;
-    }
+    if (botId.startsWith(prefix)) { cleanupBot(botId, "stop_user_all"); count++; }
   }
   return { success: true, stopped: count };
 }
@@ -947,9 +1151,7 @@ function stopBotsForUser(discordId) {
 function stopAllBots() {
   const count = activeBots.size;
   console.log(`[botmanager] 🚨 Stopping all ${count} bot(s)`);
-  for (const botId of [...activeBots.keys()]) {
-    cleanupBot(botId, "stopall");
-  }
+  for (const botId of [...activeBots.keys()]) cleanupBot(botId, "stopall");
   return { success: true, stopped: count };
 }
 
@@ -1009,6 +1211,10 @@ function getBotStatus(discordId, minecraftUser) {
       uptimeSeconds: Math.floor((Date.now() - new Date(entry.startedAt).getTime()) / 1000),
       // DonutSMP-specific info for debugging
       donutSmpVerificationRetries: entry.isDonutSmp ? entry.donutSmpVerificationRetries : undefined,
+      // FreshSMP fields exposed to Discord bot
+      isFreshSmp: entry.isFreshSmp || false,
+      freshSmpGamemode: entry.freshSmpGamemode || null,
+      freshSmpQueueSent: entry.freshSmpQueueSent || false,
     },
   };
 }
@@ -1033,6 +1239,9 @@ function getBotsForUser(discordId) {
         spawnError: entry.spawnError || null,
         errorCategory: entry.errorCategory || null,
         uptimeSeconds: Math.floor((Date.now() - new Date(entry.startedAt).getTime()) / 1000),
+        isFreshSmp: entry.isFreshSmp || false,
+        freshSmpGamemode: entry.freshSmpGamemode || null,
+        freshSmpQueueSent: entry.freshSmpQueueSent || false,
       });
     }
   }
@@ -1054,18 +1263,12 @@ function listAllBots() {
     startedAt: entry.startedAt,
     status: entry.status,
     uptimeSeconds: Math.floor((Date.now() - new Date(entry.startedAt).getTime()) / 1000),
+    isFreshSmp: entry.isFreshSmp || false,
+    freshSmpGamemode: entry.freshSmpGamemode || null,
   }));
 }
 
 module.exports = {
-  makeBotId,
-  startBot,
-  stopBot,
-  stopBotsForUser,
-  stopAllBots,
-  getBotStatus,
-  getBotsForUser,
-  listAllBots,
-  getBotCount,
-  getAndClearRecentlyEnded,
+  makeBotId, startBot, stopBot, stopBotsForUser, stopAllBots,
+  getBotStatus, getBotsForUser, listAllBots, getBotCount, getAndClearRecentlyEnded,
 };
