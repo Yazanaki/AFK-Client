@@ -173,12 +173,6 @@ const AUTO_RECONNECT = process.env.AUTO_RECONNECT === "true";
 const RECONNECT_DELAY_MS = parseInt(process.env.RECONNECT_DELAY_MS || "5000", 10);
 const MAX_BOTS = parseInt(process.env.MAX_BOTS || "0", 10); // 0 = unlimited
 
-/**
- * Check timeout interval for mineflayer's keep-alive mechanism.
- * 10 s gives 3x margin before a typical 30 s server timeout.
- */
-const CHECK_TIMEOUT_INTERVAL_MS = 10 * 1000;
-
 // ============================================================
 // VERSION CACHE — remembers which version worked per host
 // ============================================================
@@ -541,18 +535,25 @@ function startBot(
       hardDestroyBot(old);
     }
 
+    // Base options shared by all profiles
+    const baseOptions = {
+      host,
+      port,
+      username: minecraftUser,
+      version: versionToTry,
+      auth: "microsoft",
+      profilesFolder: tokenDir,
+      onMsaCode: (data) => handleDeviceCode(minecraftUser, onDeviceCode, data, botId),
+    };
+
+    // Allow the profile to inject additional createBot options (e.g. keepAlive: false)
+    const clientOptions = typeof profile.buildClientOptions === "function"
+      ? profile.buildClientOptions(baseOptions)
+      : baseOptions;
+
     let bot;
     try {
-      bot = mineflayer.createBot({
-        host,
-        port,
-        username: minecraftUser,
-        version: versionToTry,
-        auth: "microsoft",
-        profilesFolder: tokenDir,
-        onMsaCode: (data) => handleDeviceCode(minecraftUser, onDeviceCode, data, botId),
-        checkTimeoutInterval: CHECK_TIMEOUT_INTERVAL_MS,
-      });
+      bot = mineflayer.createBot(clientOptions);
     } catch (err) {
       console.error(
         `[botmanager] ❌ mineflayer.createBot threw for ${minecraftUser}:`,
