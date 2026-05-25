@@ -120,8 +120,11 @@ class DonutSmpProfile extends BaseProfile {
   }
 
   onError(bot, entry, botId, err, spawnBot) {
-    if (DonutSmpProfile.isEpipe(err.code)) {
-      DonutSmpProfile.scheduleVerificationRetry(entry, spawnBot, "epipe");
+    // EPIPE and ECONNRESET both indicate the server forcibly closed the TCP
+    // socket — this is normal during DonutSMP's pre-login security screen.
+    // Treat both as verification reconnect events rather than fatal errors.
+    if (DonutSmpProfile.isSocketResetError(err.code)) {
+      DonutSmpProfile.scheduleVerificationRetry(entry, spawnBot, `${err.code || "socket_reset"}`);
       return true;
     }
     return false;
@@ -139,6 +142,18 @@ class DonutSmpProfile extends BaseProfile {
 
   // ── Static helpers ───────────────────────────────────────────────────────────
 
+  /**
+   * Returns true for error codes that indicate the server forcibly reset the
+   * TCP connection — expected during DonutSMP's pre-login security screen.
+   *
+   * EPIPE     — write on a half-closed socket (server closed its read end)
+   * ECONNRESET — server sent TCP RST mid-stream ("write ECONNRESET")
+   */
+  static isSocketResetError(errCode) {
+    return errCode === "EPIPE" || errCode === "ECONNRESET";
+  }
+
+  /** @deprecated Use isSocketResetError instead */
   static isEpipe(errCode) { return errCode === "EPIPE"; }
 
   static isVerificationDisconnect(reason, connectedSince) {

@@ -68,13 +68,16 @@ function classifyError(err) {
   const raw = normalize(err);
   const lower = raw.toLowerCase();
 
-  // Network errors
+  // Network errors — includes ECONNRESET ("write ECONNRESET") which is a
+  // TCP-level forced socket reset, distinct from a clean disconnect.
   if (
     lower.includes("econnrefused") ||
+    lower.includes("econnreset") ||
     lower.includes("timeout") ||
     lower.includes("etimedout") ||
     lower.includes("enoent") ||
     lower.includes("ehostunreach") ||
+    lower.includes("epipe") ||
     lower.includes("dns")
   ) {
     return {
@@ -125,4 +128,3 @@ module.exports = {
   classifyKick,
   classifyError,
 };
-

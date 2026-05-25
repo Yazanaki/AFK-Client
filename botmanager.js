@@ -281,6 +281,19 @@ function isFatalNetworkError(errCode, errMessage) {
   return msg.includes("enotfound") || msg.includes("getaddrinfo");
 }
 
+/**
+ * Returns true for errors that indicate the server forcibly reset the TCP
+ * connection. These are transient and should be reconnected, not treated
+ * as fatal errors. DonutSMP's profile handles these explicitly; this guard
+ * prevents other profiles from misclassifying them as hard failures.
+ *
+ * ECONNRESET — server sent TCP RST ("write ECONNRESET")
+ * EPIPE      — write on a half-closed socket
+ */
+function isTransientSocketError(errCode) {
+  return errCode === "ECONNRESET" || errCode === "EPIPE";
+}
+
 function getFatalErrorMessage(errCode, errMessage) {
   if (errCode === "ENOTFOUND" || (errMessage || "").toLowerCase().includes("getaddrinfo")) {
     return (
@@ -725,7 +738,8 @@ function startBot(
       const errCode = err.code;
       const errMessage = err.message || "";
 
-      // Delegate to profile first
+      // Delegate to profile first — profiles (e.g. DonutSmpProfile) may claim
+      // ownership of specific error codes such as ECONNRESET and EPIPE.
       let profileHandled = false;
       try {
         profileHandled = profile.onError(bot, e, botId, err, spawnBot);
@@ -734,6 +748,33 @@ function startBot(
       }
 
       if (profileHandled) return;
+
+      // ── Transient socket reset (ECONNRESET / EPIPE) ──────────────────────
+      // The server forcibly closed the TCP connection. This is not a fatal
+      // error — it typically happens during server restarts or anti-bot
+      // handshakes on non-DonutSMP servers. Reconnect if AUTO_RECONNECT is
+      // enabled; otherwise clean up gracefully without alarming the user.
+      if (isTransientSocketError(errCode)) {
+        console.warn(
+          `[botmanager] 🔌 Socket reset (${errCode}) for ${minecraftUser} — server closed the connection`
+        );
+        e.status = "error";
+        e.spawnError = `Connection reset by server (${errCode})`;
+
+        if (AUTO_RECONNECT) {
+          console.log(
+            `[botmanager] 🔄 Reconnecting ${minecraftUser} in ${RECONNECT_DELAY_MS}ms (${errCode})...`
+          );
+          e.status = "reconnecting";
+          setTimeout(() => {
+            if (!activeBots.has(botId)) return;
+            spawnBot(activeBots.get(botId).version);
+          }, RECONNECT_DELAY_MS);
+        } else {
+          cleanupBot(botId, "socket_reset");
+        }
+        return;
+      }
 
       console.error(`[botmanager] ❌ Bot error (${minecraftUser}):`, errMessage);
 
