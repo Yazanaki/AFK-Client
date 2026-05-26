@@ -70,6 +70,12 @@ const LINK_VERIFIED_EXPIRY_MS = 5 * 60 * 1000;
 // PENDING FRESHSMP SPAWNED NOTIFICATIONS
 // Map<botId, { discordId, minecraftUser, serverHost, createdAt }>
 // Consumed once by the Discord bot's poll loop.
+//
+// IMPORTANT: This map must be cleared for a botId whenever the bot
+// ends unexpectedly (kicked, error, etc.) — otherwise the Discord bot
+// will show a gamemode selector DM for a bot that's already dead.
+// This is handled in GET /ended: we purge entries for all ended bots
+// before returning them to the Discord bot.
 // ============================================================
 const pendingFreshSmpSpawned = new Map();
 const FRESHSMP_SPAWNED_EXPIRY_MS = 10 * 60 * 1000;
@@ -436,10 +442,28 @@ app.post("/stopall", (req, res) => {
 // ============================================================
 // ROUTE: Get recently ended bots (for botmonitor DM notifications)
 // GET /ended
+//
+// Also purges any pendingFreshSmpSpawned entries for bots that have
+// ended — prevents the Discord bot from showing a gamemode selector
+// DM for a bot that was kicked before the selector was interacted with.
 // ============================================================
 
 app.get("/ended", (req, res) => {
   const bots = getAndClearRecentlyEnded();
+
+  // Clean up stale FreshSMP spawned entries for bots that have now ended.
+  // This covers the race: login fires → onFreshSmpSpawned stores entry →
+  // bot is kicked → Discord bot polls /ended and /freshsmp/spawned in the
+  // same cycle, potentially consuming the spawned entry for a dead bot.
+  for (const bot of bots) {
+    if (pendingFreshSmpSpawned.has(bot.botId)) {
+      pendingFreshSmpSpawned.delete(bot.botId);
+      console.log(
+        `[server] 🧹 Cleared stale FreshSMP spawned entry for ended bot: ${bot.botId}`
+      );
+    }
+  }
+
   if (bots.length > 0) {
     console.log(`[server] 📥 GET /ended — returning ${bots.length} ended bot(s)`);
   }

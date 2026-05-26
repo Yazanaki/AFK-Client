@@ -1,3 +1,4 @@
+// afk-core/src/profile/DonutSmpProfile.js
 "use strict";
 
 const { BaseProfile } = require("./BaseProfile");
@@ -6,20 +7,30 @@ const DONUTSMP_VERSION = "1.21.11";
 const MAX_VERIFICATION_RETRIES = 10;
 const VERIFICATION_RECONNECT_DELAY_MS = 5000;
 
+// A socket reset is only considered a verification event if:
+//   - connectedSince is null (bot never made it past login), OR
+//   - the session was younger than this threshold when the reset happened.
+// After this window, EPIPE/ECONNRESET are treated as normal disconnects.
+const VERIFICATION_WINDOW_SECONDS = 60;
+
+// Anti-AFK head rotation — fires via origWrite to bypass the movement block.
+// Interval is randomized each time to avoid a detectable pattern.
+const ANTI_AFK_MIN_MS = 3 * 60 * 1000; // 3 minutes
+const ANTI_AFK_MAX_MS = 6 * 60 * 1000; // 6 minutes
+const ANTI_AFK_YAW_DELTA_MIN = 2;       // degrees
+const ANTI_AFK_YAW_DELTA_MAX = 8;       // degrees
+const ANTI_AFK_RETURN_DELAY_MS = 1500;  // ms before nudging back
+
 const KEEP_ALIVE_DEBUG =
   String(process.env.DONUTSMP_DEBUG || "minimal").toLowerCase() === "forensic";
 
 class DonutSmpProfile extends BaseProfile {
   constructor() {
     super("donutsmp", DONUTSMP_VERSION);
+    // Map<botId, timeoutId> — one scheduled timeout per active bot
+    this._antiAfkTimers = new Map();
   }
 
-  /**
-   * Called by botmanager before createBot() to allow profile-specific
-   * client options. We disable minecraft-protocol's built-in keepAlive
-   * checker entirely so it can't fire the "timed out after 10000ms" error.
-   * We handle keep-alive ourselves in onBotCreated instead.
-   */
   buildClientOptions(base) {
     return {
       ...base,
@@ -56,13 +67,6 @@ class DonutSmpProfile extends BaseProfile {
     entry._donutOrigWrite = origWrite;
 
     // ── Manual keep-alive echo ───────────────────────────────────────────────
-    //
-    // minecraft-protocol's built-in keepAlive handler is disabled via
-    // keepAlive:false in buildClientOptions(). We take full ownership here.
-    //
-    // This listener fires on the raw _client — before AND after login —
-    // so DonutSMP's pre-login security screen keep-alives are covered.
-    // We use origWrite (pre-movement-patch) to guarantee the echo is sent.
     bot._client.on("keep_alive", (packet) => {
       try {
         origWrite("keep_alive", { keepAliveId: packet.keepAliveId });
@@ -103,8 +107,15 @@ class DonutSmpProfile extends BaseProfile {
       console.log(`[DonutSmpProfile] plugin_message channel=${channel} bytes=${dataLen}`);
     });
 
+    // ── Anti-AFK head rotation — start scheduling after login ────────────────
+    // We wait for login so we have a valid yaw to work from, and so we don't
+    // send look packets during the pre-login security screen.
+    bot.once("login", () => {
+      this._scheduleAntiAfk(botId, entry, bot, origWrite);
+    });
+
     console.log(
-      `[DonutSmpProfile] ✅ Handlers attached — movement block + manual keep-alive + ping/pong active`
+      `[DonutSmpProfile] ✅ Handlers attached — movement block + manual keep-alive + ping/pong + anti-AFK active`
     );
   }
 
@@ -120,12 +131,20 @@ class DonutSmpProfile extends BaseProfile {
   }
 
   onError(bot, entry, botId, err, spawnBot) {
-    // EPIPE and ECONNRESET both indicate the server forcibly closed the TCP
-    // socket — this is normal during DonutSMP's pre-login security screen.
-    // Treat both as verification reconnect events rather than fatal errors.
     if (DonutSmpProfile.isSocketResetError(err.code)) {
-      DonutSmpProfile.scheduleVerificationRetry(entry, spawnBot, `${err.code || "socket_reset"}`);
-      return true;
+      if (DonutSmpProfile.isWithinVerificationWindow(entry.connectedSince)) {
+        DonutSmpProfile.scheduleVerificationRetry(entry, spawnBot, `${err.code || "socket_reset"}`);
+        return true;
+      }
+      const uptimeSec = entry.connectedSince
+        ? Math.floor((Date.now() - entry.connectedSince) / 1000)
+        : null;
+      console.log(
+        `[DonutSmpProfile] 🔌 [${entry.minecraftUser}] ${err.code} after ${
+          uptimeSec !== null ? uptimeSec + "s online" : "pre-login"
+        } — not a verification event, deferring to botmanager`
+      );
+      return false;
     }
     return false;
   }
@@ -138,17 +157,104 @@ class DonutSmpProfile extends BaseProfile {
     return false;
   }
 
-  onCleanup(botId) {}
+  onCleanup(botId) {
+    this._cancelAntiAfk(botId);
+  }
+
+  // ── Anti-AFK ─────────────────────────────────────────────────────────────────
+
+  /**
+   * Schedule the next anti-AFK head nudge for this bot.
+   * Uses a randomized interval each time so the pattern isn't mechanical.
+   */
+  _scheduleAntiAfk(botId, entry, bot, origWrite) {
+    this._cancelAntiAfk(botId);
+
+    const delayMs =
+      ANTI_AFK_MIN_MS +
+      Math.floor(Math.random() * (ANTI_AFK_MAX_MS - ANTI_AFK_MIN_MS));
+
+    const timerId = setTimeout(() => {
+      this._antiAfkTimers.delete(botId);
+      this._doAntiAfkNudge(botId, entry, bot, origWrite);
+    }, delayMs);
+
+    this._antiAfkTimers.set(botId, timerId);
+  }
+
+  /**
+   * Perform a small random yaw nudge, then nudge back after a short delay.
+   * Only fires if the bot is still online. Schedules the next nudge when done.
+   */
+  _doAntiAfkNudge(botId, entry, bot, origWrite) {
+    // Bail if bot is no longer active or not online
+    if (entry.status !== "online") return;
+    if (!bot || bot._client?.ended) return;
+
+    // Read current yaw from mineflayer's entity — falls back to 0 if unavailable
+    const currentYaw = (bot.entity && typeof bot.entity.yaw === "number")
+      ? bot.entity.yaw
+      : 0;
+    const currentPitch = (bot.entity && typeof bot.entity.pitch === "number")
+      ? bot.entity.pitch
+      : 0;
+
+    // Random yaw delta in degrees, converted to radians, randomly left or right
+    const deltaDeg =
+      ANTI_AFK_YAW_DELTA_MIN +
+      Math.random() * (ANTI_AFK_YAW_DELTA_MAX - ANTI_AFK_YAW_DELTA_MIN);
+    const deltaRad = (deltaDeg * Math.PI) / 180;
+    const direction = Math.random() < 0.5 ? 1 : -1;
+    const nudgedYaw = currentYaw + direction * deltaRad;
+
+    try {
+      origWrite("look", {
+        yaw: nudgedYaw,
+        pitch: currentPitch,
+        onGround: true,
+      });
+      console.log(
+        `[DonutSmpProfile] 👀 [${entry.minecraftUser}] Anti-AFK nudge ` +
+        `${direction > 0 ? "+" : ""}${(direction * deltaDeg).toFixed(1)}° yaw`
+      );
+    } catch (err) {
+      console.warn(`[DonutSmpProfile] ⚠️ Anti-AFK write failed:`, err.message);
+      // Don't reschedule if the socket is already dead
+      return;
+    }
+
+    // Nudge back to original yaw after a short delay so it looks like a glance
+    setTimeout(() => {
+      if (entry.status !== "online") return;
+      if (!bot || bot._client?.ended) return;
+      try {
+        origWrite("look", {
+          yaw: currentYaw,
+          pitch: currentPitch,
+          onGround: true,
+        });
+      } catch {
+        // Socket closed between nudge and return — not critical
+      }
+
+      // Schedule next nudge only after the full nudge+return cycle completes
+      this._scheduleAntiAfk(botId, entry, bot, origWrite);
+    }, ANTI_AFK_RETURN_DELAY_MS);
+  }
+
+  /**
+   * Cancel any pending anti-AFK timer for this bot.
+   */
+  _cancelAntiAfk(botId) {
+    const timerId = this._antiAfkTimers.get(botId);
+    if (timerId != null) {
+      clearTimeout(timerId);
+      this._antiAfkTimers.delete(botId);
+    }
+  }
 
   // ── Static helpers ───────────────────────────────────────────────────────────
 
-  /**
-   * Returns true for error codes that indicate the server forcibly reset the
-   * TCP connection — expected during DonutSMP's pre-login security screen.
-   *
-   * EPIPE     — write on a half-closed socket (server closed its read end)
-   * ECONNRESET — server sent TCP RST mid-stream ("write ECONNRESET")
-   */
   static isSocketResetError(errCode) {
     return errCode === "EPIPE" || errCode === "ECONNRESET";
   }
@@ -156,12 +262,16 @@ class DonutSmpProfile extends BaseProfile {
   /** @deprecated Use isSocketResetError instead */
   static isEpipe(errCode) { return errCode === "EPIPE"; }
 
+  static isWithinVerificationWindow(connectedSince) {
+    if (connectedSince === null) return true;
+    return (Date.now() - connectedSince) / 1000 < VERIFICATION_WINDOW_SECONDS;
+  }
+
   static isVerificationDisconnect(reason, connectedSince) {
     if (!reason) return false;
     const r = (typeof reason === "string" ? reason : JSON.stringify(reason)).toLowerCase();
     if (!r.includes("socketclosed")) return false;
-    if (connectedSince === null) return true;
-    return Math.floor((Date.now() - connectedSince) / 1000) < 30;
+    return DonutSmpProfile.isWithinVerificationWindow(connectedSince);
   }
 
   static isVerificationKick(reasonText) {
