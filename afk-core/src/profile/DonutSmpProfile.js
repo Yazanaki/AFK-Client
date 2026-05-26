@@ -20,7 +20,6 @@ const ANTI_AFK_RETURN_DELAY_MS = 1500;
 // TCP keepalive — OS-level probes sent on idle connections.
 // This detects when DonutSMP silently drops the TCP connection so we get a
 // clean ECONNRESET before the next write, instead of an EPIPE mid-write.
-// 60s idle before first probe; probes every 10s after that.
 const TCP_KEEPALIVE_INITIAL_DELAY_MS = 60 * 1000;
 
 const KEEP_ALIVE_DEBUG =
@@ -79,9 +78,6 @@ class DonutSmpProfile extends BaseProfile {
     // tiny probe packets after TCP_KEEPALIVE_INITIAL_DELAY_MS of idle time.
     // If the server doesn't respond, the socket gets ECONNRESET cleanly
     // instead of us discovering the dead connection mid-write via EPIPE.
-    //
-    // We attach this on the 'connect' event rather than immediately because
-    // bot._client.socket may not exist yet at onBotCreated time.
     bot._client.once("connect", () => {
       try {
         const socket = bot._client.socket;
@@ -139,6 +135,8 @@ class DonutSmpProfile extends BaseProfile {
     });
 
     // ── Anti-AFK — start scheduling after login ──────────────────────────────
+    // Wait for login so we have a valid entity yaw/pitch to work from, and so
+    // we don't send look packets during the pre-login security screen.
     bot.once("login", () => {
       this._scheduleAntiAfk(botId, entry, bot);
     });
@@ -153,6 +151,9 @@ class DonutSmpProfile extends BaseProfile {
 
   onKick(bot, entry, botId, reasonText, spawnBot, autoMode, candidates, autoVersionState) {
     if (DonutSmpProfile.isVerificationKick(reasonText)) {
+      console.log(
+        `[DonutSmpProfile] 🔐 [${entry.minecraftUser}] Verification kick detected — scheduling reconnect`
+      );
       DonutSmpProfile.scheduleVerificationRetry(entry, spawnBot, "kick");
       return true;
     }
@@ -275,10 +276,19 @@ class DonutSmpProfile extends BaseProfile {
     if (!reasonText) return false;
     const r = reasonText.toLowerCase();
     return (
+      // socketclosed / pre-login disconnects
       r.includes("socketclosed") ||
+      // generic verification language
       r.includes("verification") ||
       r.includes("please verify") ||
-      r.includes("security check")
+      r.includes("security check") ||
+      // DonutSMP's actual kick message (observed in logs)
+      r.includes("unauthorized login") ||
+      r.includes("blocked it") ||
+      r.includes("confirm it via") ||
+      r.includes("discord dms") ||
+      r.includes("direct messages enabled") ||
+      r.includes("donutsmp")
     );
   }
 
