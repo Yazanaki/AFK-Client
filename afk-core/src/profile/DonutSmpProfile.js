@@ -7,18 +7,21 @@ const DONUTSMP_VERSION = "1.21.11";
 const MAX_VERIFICATION_RETRIES = 10;
 const VERIFICATION_RECONNECT_DELAY_MS = 5000;
 
-// A socket reset is only considered a verification event if:
-//   - connectedSince is null (bot never made it past login), OR
-//   - the session was younger than this threshold when the reset happened.
-// After this window, EPIPE/ECONNRESET are treated as normal disconnects.
 const VERIFICATION_WINDOW_SECONDS = 60;
+const MID_SESSION_RECONNECT_DELAY_MS = 8000;
 
 // Anti-AFK head rotation timings
-const ANTI_AFK_MIN_MS = 3 * 60 * 1000; // 3 minutes
-const ANTI_AFK_MAX_MS = 6 * 60 * 1000; // 6 minutes
-const ANTI_AFK_YAW_DELTA_MIN = 2;       // degrees
-const ANTI_AFK_YAW_DELTA_MAX = 8;       // degrees
-const ANTI_AFK_RETURN_DELAY_MS = 1500;  // ms before nudging back
+const ANTI_AFK_MIN_MS = 3 * 60 * 1000;
+const ANTI_AFK_MAX_MS = 6 * 60 * 1000;
+const ANTI_AFK_YAW_DELTA_MIN = 2;
+const ANTI_AFK_YAW_DELTA_MAX = 8;
+const ANTI_AFK_RETURN_DELAY_MS = 1500;
+
+// TCP keepalive — OS-level probes sent on idle connections.
+// This detects when DonutSMP silently drops the TCP connection so we get a
+// clean ECONNRESET before the next write, instead of an EPIPE mid-write.
+// 60s idle before first probe; probes every 10s after that.
+const TCP_KEEPALIVE_INITIAL_DELAY_MS = 60 * 1000;
 
 const KEEP_ALIVE_DEBUG =
   String(process.env.DONUTSMP_DEBUG || "minimal").toLowerCase() === "forensic";
@@ -26,14 +29,9 @@ const KEEP_ALIVE_DEBUG =
 class DonutSmpProfile extends BaseProfile {
   constructor() {
     super("donutsmp", DONUTSMP_VERSION);
-    // Map<botId, timeoutId> — one scheduled timeout per active bot
     this._antiAfkTimers = new Map();
   }
 
-  /**
-   * Disable minecraft-protocol's built-in keepAlive checker — we handle
-   * keep-alive ourselves in onBotCreated.
-   */
   buildClientOptions(base) {
     return {
       ...base,
@@ -76,7 +74,29 @@ class DonutSmpProfile extends BaseProfile {
 
     entry._donutOrigWrite = origWrite;
 
-    // ── Manual keep-alive echo ───────────────────────────────────────────────
+    // ── TCP keepalive — OS-level ─────────────────────────────────────────────
+    // Enables SO_KEEPALIVE on the underlying TCP socket. The OS will send
+    // tiny probe packets after TCP_KEEPALIVE_INITIAL_DELAY_MS of idle time.
+    // If the server doesn't respond, the socket gets ECONNRESET cleanly
+    // instead of us discovering the dead connection mid-write via EPIPE.
+    //
+    // We attach this on the 'connect' event rather than immediately because
+    // bot._client.socket may not exist yet at onBotCreated time.
+    bot._client.once("connect", () => {
+      try {
+        const socket = bot._client.socket;
+        if (socket && typeof socket.setKeepAlive === "function") {
+          socket.setKeepAlive(true, TCP_KEEPALIVE_INITIAL_DELAY_MS);
+          console.log(
+            `[DonutSmpProfile] 🔌 TCP keepalive enabled (idle probe after ${TCP_KEEPALIVE_INITIAL_DELAY_MS / 1000}s)`
+          );
+        }
+      } catch (err) {
+        console.warn(`[DonutSmpProfile] ⚠️ Could not set TCP keepalive:`, err.message);
+      }
+    });
+
+    // ── Manual Minecraft keep-alive echo ─────────────────────────────────────
     // We use origWrite (pre-movement-patch) to guarantee the echo is sent.
     bot._client.on("keep_alive", (packet) => {
       try {
@@ -119,14 +139,12 @@ class DonutSmpProfile extends BaseProfile {
     });
 
     // ── Anti-AFK — start scheduling after login ──────────────────────────────
-    // Wait for login so we have a valid entity yaw/pitch to work from, and so
-    // we don't send look packets during the pre-login security screen.
     bot.once("login", () => {
       this._scheduleAntiAfk(botId, entry, bot);
     });
 
     console.log(
-      `[DonutSmpProfile] ✅ Handlers attached — movement block + manual keep-alive + ping/pong + anti-AFK active`
+      `[DonutSmpProfile] ✅ Handlers attached — movement block + manual keep-alive + ping/pong + anti-AFK + TCP keepalive active`
     );
   }
 
@@ -142,22 +160,27 @@ class DonutSmpProfile extends BaseProfile {
   }
 
   onError(bot, entry, botId, err, spawnBot) {
-    if (DonutSmpProfile.isSocketResetError(err.code)) {
-      if (DonutSmpProfile.isWithinVerificationWindow(entry.connectedSince)) {
-        DonutSmpProfile.scheduleVerificationRetry(entry, spawnBot, `${err.code || "socket_reset"}`);
-        return true;
-      }
-      const uptimeSec = entry.connectedSince
-        ? Math.floor((Date.now() - entry.connectedSince) / 1000)
-        : null;
-      console.log(
-        `[DonutSmpProfile] 🔌 [${entry.minecraftUser}] ${err.code} after ${
-          uptimeSec !== null ? uptimeSec + "s online" : "pre-login"
-        } — not a verification event, deferring to botmanager`
-      );
-      return false;
+    if (!DonutSmpProfile.isSocketResetError(err.code)) return false;
+
+    if (DonutSmpProfile.isWithinVerificationWindow(entry.connectedSince)) {
+      // Pre-login or very early session — treat as verification reconnect.
+      DonutSmpProfile.scheduleVerificationRetry(entry, spawnBot, `${err.code}`);
+      return true;
     }
-    return false;
+
+    // Mid-session drop — reconnect silently without incrementing the
+    // verification retry counter and without letting botmanager record
+    // this as an ended bot (which would DM the user).
+    const uptimeSec = entry.connectedSince
+      ? Math.floor((Date.now() - entry.connectedSince) / 1000)
+      : null;
+    console.log(
+      `[DonutSmpProfile] 🔄 [${entry.minecraftUser}] Mid-session ${err.code} after ` +
+      `${uptimeSec !== null ? uptimeSec + "s online" : "pre-login"} — reconnecting silently in ${MID_SESSION_RECONNECT_DELAY_MS}ms`
+    );
+    entry.status = "reconnecting";
+    setTimeout(() => spawnBot(DONUTSMP_VERSION), MID_SESSION_RECONNECT_DELAY_MS);
+    return true;
   }
 
   onEnd(bot, entry, botId, reason, spawnBot) {
@@ -174,10 +197,6 @@ class DonutSmpProfile extends BaseProfile {
 
   // ── Anti-AFK ─────────────────────────────────────────────────────────────────
 
-  /**
-   * Schedule the next anti-AFK head nudge for this bot.
-   * Uses a randomized interval each time so the pattern isn't mechanical.
-   */
   _scheduleAntiAfk(botId, entry, bot) {
     this._cancelAntiAfk(botId);
 
@@ -193,25 +212,14 @@ class DonutSmpProfile extends BaseProfile {
     this._antiAfkTimers.set(botId, timerId);
   }
 
-  /**
-   * Perform a small random yaw nudge using bot.look(), then nudge back.
-   *
-   * bot.look(yaw, pitch, force) is used instead of raw origWrite("look", ...)
-   * because in 1.21.2+ the look packet schema changed (added movementFlags).
-   * Sending raw packets with the old {yaw, pitch, onGround} layout causes:
-   *   "SizeOf error for undefined : Cannot read properties of undefined (reading '_value')"
-   * bot.look() handles the correct packet format for whatever version is connected.
-   */
   _doAntiAfkNudge(botId, entry, bot) {
     if (entry.status !== "online") return;
     if (!bot || bot._client?.ended) return;
 
     const currentYaw = (bot.entity && typeof bot.entity.yaw === "number")
-      ? bot.entity.yaw
-      : 0;
+      ? bot.entity.yaw : 0;
     const currentPitch = (bot.entity && typeof bot.entity.pitch === "number")
-      ? bot.entity.pitch
-      : 0;
+      ? bot.entity.pitch : 0;
 
     const deltaDeg =
       ANTI_AFK_YAW_DELTA_MIN +
@@ -220,27 +228,20 @@ class DonutSmpProfile extends BaseProfile {
     const direction = Math.random() < 0.5 ? 1 : -1;
     const nudgedYaw = currentYaw + direction * deltaRad;
 
-    // force=true so it snaps immediately rather than interpolating over ticks
     bot.look(nudgedYaw, currentPitch, true);
     console.log(
       `[DonutSmpProfile] 👀 [${entry.minecraftUser}] Anti-AFK nudge ` +
       `${direction > 0 ? "+" : ""}${(direction * deltaDeg).toFixed(1)}° yaw`
     );
 
-    // Nudge back to original yaw after a short delay so it looks like a glance
     setTimeout(() => {
       if (entry.status !== "online") return;
       if (!bot || bot._client?.ended) return;
       bot.look(currentYaw, currentPitch, true);
-
-      // Schedule next nudge only after the full nudge+return cycle completes
       this._scheduleAntiAfk(botId, entry, bot);
     }, ANTI_AFK_RETURN_DELAY_MS);
   }
 
-  /**
-   * Cancel any pending anti-AFK timer for this bot.
-   */
   _cancelAntiAfk(botId) {
     const timerId = this._antiAfkTimers.get(botId);
     if (timerId != null) {
