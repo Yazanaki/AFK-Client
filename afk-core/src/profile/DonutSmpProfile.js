@@ -13,8 +13,7 @@ const VERIFICATION_RECONNECT_DELAY_MS = 5000;
 // After this window, EPIPE/ECONNRESET are treated as normal disconnects.
 const VERIFICATION_WINDOW_SECONDS = 60;
 
-// Anti-AFK head rotation — fires via origWrite to bypass the movement block.
-// Interval is randomized each time to avoid a detectable pattern.
+// Anti-AFK head rotation timings
 const ANTI_AFK_MIN_MS = 3 * 60 * 1000; // 3 minutes
 const ANTI_AFK_MAX_MS = 6 * 60 * 1000; // 6 minutes
 const ANTI_AFK_YAW_DELTA_MIN = 2;       // degrees
@@ -31,6 +30,10 @@ class DonutSmpProfile extends BaseProfile {
     this._antiAfkTimers = new Map();
   }
 
+  /**
+   * Disable minecraft-protocol's built-in keepAlive checker — we handle
+   * keep-alive ourselves in onBotCreated.
+   */
   buildClientOptions(base) {
     return {
       ...base,
@@ -40,7 +43,14 @@ class DonutSmpProfile extends BaseProfile {
 
   onBotCreated(bot, entry, botId, spawnBot) {
     const origWrite = bot._client.write.bind(bot._client);
-    const BLOCKED = new Set(["position", "flying", "look"]);
+
+    // Block position and flying packets only.
+    // We intentionally do NOT block "look" here — mineflayer's bot.look()
+    // API handles the correct packet format for 1.21.11 (which changed from
+    // the old {yaw, pitch, onGround} layout). Sending raw "look" packets via
+    // origWrite causes a "SizeOf error for undefined" serialization crash on
+    // 1.21.2+ because the schema now requires a movementFlags field.
+    const BLOCKED = new Set(["position", "flying"]);
 
     // ── Movement suppression ─────────────────────────────────────────────────
     bot._client.write = function donutSmpMovementBlock(name, params) {
@@ -67,6 +77,7 @@ class DonutSmpProfile extends BaseProfile {
     entry._donutOrigWrite = origWrite;
 
     // ── Manual keep-alive echo ───────────────────────────────────────────────
+    // We use origWrite (pre-movement-patch) to guarantee the echo is sent.
     bot._client.on("keep_alive", (packet) => {
       try {
         origWrite("keep_alive", { keepAliveId: packet.keepAliveId });
@@ -107,11 +118,11 @@ class DonutSmpProfile extends BaseProfile {
       console.log(`[DonutSmpProfile] plugin_message channel=${channel} bytes=${dataLen}`);
     });
 
-    // ── Anti-AFK head rotation — start scheduling after login ────────────────
-    // We wait for login so we have a valid yaw to work from, and so we don't
-    // send look packets during the pre-login security screen.
+    // ── Anti-AFK — start scheduling after login ──────────────────────────────
+    // Wait for login so we have a valid entity yaw/pitch to work from, and so
+    // we don't send look packets during the pre-login security screen.
     bot.once("login", () => {
-      this._scheduleAntiAfk(botId, entry, bot, origWrite);
+      this._scheduleAntiAfk(botId, entry, bot);
     });
 
     console.log(
@@ -167,7 +178,7 @@ class DonutSmpProfile extends BaseProfile {
    * Schedule the next anti-AFK head nudge for this bot.
    * Uses a randomized interval each time so the pattern isn't mechanical.
    */
-  _scheduleAntiAfk(botId, entry, bot, origWrite) {
+  _scheduleAntiAfk(botId, entry, bot) {
     this._cancelAntiAfk(botId);
 
     const delayMs =
@@ -176,22 +187,25 @@ class DonutSmpProfile extends BaseProfile {
 
     const timerId = setTimeout(() => {
       this._antiAfkTimers.delete(botId);
-      this._doAntiAfkNudge(botId, entry, bot, origWrite);
+      this._doAntiAfkNudge(botId, entry, bot);
     }, delayMs);
 
     this._antiAfkTimers.set(botId, timerId);
   }
 
   /**
-   * Perform a small random yaw nudge, then nudge back after a short delay.
-   * Only fires if the bot is still online. Schedules the next nudge when done.
+   * Perform a small random yaw nudge using bot.look(), then nudge back.
+   *
+   * bot.look(yaw, pitch, force) is used instead of raw origWrite("look", ...)
+   * because in 1.21.2+ the look packet schema changed (added movementFlags).
+   * Sending raw packets with the old {yaw, pitch, onGround} layout causes:
+   *   "SizeOf error for undefined : Cannot read properties of undefined (reading '_value')"
+   * bot.look() handles the correct packet format for whatever version is connected.
    */
-  _doAntiAfkNudge(botId, entry, bot, origWrite) {
-    // Bail if bot is no longer active or not online
+  _doAntiAfkNudge(botId, entry, bot) {
     if (entry.status !== "online") return;
     if (!bot || bot._client?.ended) return;
 
-    // Read current yaw from mineflayer's entity — falls back to 0 if unavailable
     const currentYaw = (bot.entity && typeof bot.entity.yaw === "number")
       ? bot.entity.yaw
       : 0;
@@ -199,7 +213,6 @@ class DonutSmpProfile extends BaseProfile {
       ? bot.entity.pitch
       : 0;
 
-    // Random yaw delta in degrees, converted to radians, randomly left or right
     const deltaDeg =
       ANTI_AFK_YAW_DELTA_MIN +
       Math.random() * (ANTI_AFK_YAW_DELTA_MAX - ANTI_AFK_YAW_DELTA_MIN);
@@ -207,38 +220,21 @@ class DonutSmpProfile extends BaseProfile {
     const direction = Math.random() < 0.5 ? 1 : -1;
     const nudgedYaw = currentYaw + direction * deltaRad;
 
-    try {
-      origWrite("look", {
-        yaw: nudgedYaw,
-        pitch: currentPitch,
-        onGround: true,
-      });
-      console.log(
-        `[DonutSmpProfile] 👀 [${entry.minecraftUser}] Anti-AFK nudge ` +
-        `${direction > 0 ? "+" : ""}${(direction * deltaDeg).toFixed(1)}° yaw`
-      );
-    } catch (err) {
-      console.warn(`[DonutSmpProfile] ⚠️ Anti-AFK write failed:`, err.message);
-      // Don't reschedule if the socket is already dead
-      return;
-    }
+    // force=true so it snaps immediately rather than interpolating over ticks
+    bot.look(nudgedYaw, currentPitch, true);
+    console.log(
+      `[DonutSmpProfile] 👀 [${entry.minecraftUser}] Anti-AFK nudge ` +
+      `${direction > 0 ? "+" : ""}${(direction * deltaDeg).toFixed(1)}° yaw`
+    );
 
     // Nudge back to original yaw after a short delay so it looks like a glance
     setTimeout(() => {
       if (entry.status !== "online") return;
       if (!bot || bot._client?.ended) return;
-      try {
-        origWrite("look", {
-          yaw: currentYaw,
-          pitch: currentPitch,
-          onGround: true,
-        });
-      } catch {
-        // Socket closed between nudge and return — not critical
-      }
+      bot.look(currentYaw, currentPitch, true);
 
       // Schedule next nudge only after the full nudge+return cycle completes
-      this._scheduleAntiAfk(botId, entry, bot, origWrite);
+      this._scheduleAntiAfk(botId, entry, bot);
     }, ANTI_AFK_RETURN_DELAY_MS);
   }
 
