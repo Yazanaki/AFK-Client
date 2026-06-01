@@ -284,11 +284,7 @@ function isFatalNetworkError(errCode, errMessage) {
 /**
  * Returns true for errors that indicate the server forcibly reset the TCP
  * connection. These are transient and should be reconnected, not treated
- * as fatal errors. DonutSMP's profile handles these explicitly; this guard
- * prevents other profiles from misclassifying them as hard failures.
- *
- * ECONNRESET — server sent TCP RST ("write ECONNRESET")
- * EPIPE      — write on a half-closed socket
+ * as fatal errors.
  */
 function isTransientSocketError(errCode) {
   return errCode === "ECONNRESET" || errCode === "EPIPE";
@@ -446,14 +442,8 @@ function startBot(
   const hostLower = host.toLowerCase();
 
   // ── Version resolution ──────────────────────────────────────────────────────
-  // Priority:
-  //   1. Profile's fixed version (e.g. DonutSMP always uses 1.21.11)
-  //   2. Explicit version passed by caller (if not "auto")
-  //   3. Version cache (last known-good for this host)
-  //   4. First auto-detection candidate
-
   const profile = getProfileForHost(hostLower);
-  const profileVersion = profile.version; // "auto" or a fixed version string
+  const profileVersion = profile.version;
 
   const requestedVersion = String(version || "auto").trim().toLowerCase();
 
@@ -461,7 +451,6 @@ function startBot(
   let autoMode = false;
 
   if (profileVersion !== "auto") {
-    // Profile mandates a fixed version — always use it, ignore caller's request
     effectiveVersion = profileVersion;
     if (requestedVersion !== "auto" && requestedVersion !== profileVersion) {
       console.warn(
@@ -470,10 +459,8 @@ function startBot(
       );
     }
   } else if (requestedVersion !== "auto") {
-    // Caller specified a concrete version and the profile has no preference
     effectiveVersion = requestedVersion;
   } else {
-    // Full auto-detection
     autoMode = true;
     effectiveVersion = versionCache.get(hostLower) || AUTO_VERSION_CANDIDATES[0];
   }
@@ -501,7 +488,6 @@ function startBot(
     connectedSince: null,
     lastKickReason: null,
     errorCategory: null,
-    // Profile-specific state — profiles may add their own fields to entry
     donutSmpVerificationRetries: 0,
     donutSmpReadyAt: 0,
     freshSmpGamemode: null,
@@ -514,14 +500,13 @@ function startBot(
   let isEating = false;
   let eatCooldownUntil = 0;
 
-  // Spawn timeout — longer for servers with a verification handshake (e.g. DonutSMP)
   const initialSpawnTimeoutMs = profile.id === "donutsmp" ? 90000 : 30000;
 
   entry.spawnTimeoutId = setTimeout(() => {
     if (!activeBots.has(botId)) return;
     const e = activeBots.get(botId);
     if (e.status !== "connecting") return;
-    if (e.deviceCodeEmitted) return; // auth timeout handled separately
+    if (e.deviceCodeEmitted) return;
     console.warn(
       `[botmanager] ⏰ Spawn timeout for ${minecraftUser} after ` +
       `${Math.round(initialSpawnTimeoutMs / 1000)}s — cleaning up`
@@ -541,14 +526,12 @@ function startBot(
     entry.version = versionToTry;
     entry.connectedSince = null;
 
-    // Hard-destroy any previous instance before spawning a new one
     if (entry.bot) {
       const old = entry.bot;
       entry.bot = null;
       hardDestroyBot(old);
     }
 
-    // Base options shared by all profiles
     const baseOptions = {
       host,
       port,
@@ -559,7 +542,6 @@ function startBot(
       onMsaCode: (data) => handleDeviceCode(minecraftUser, onDeviceCode, data, botId),
     };
 
-    // Allow the profile to inject additional createBot options (e.g. keepAlive: false)
     const clientOptions = typeof profile.buildClientOptions === "function"
       ? profile.buildClientOptions(baseOptions)
       : baseOptions;
@@ -580,7 +562,6 @@ function startBot(
 
     entry.bot = bot;
 
-    // Guard — ensures stale events from a superseded bot instance are ignored
     function isCurrentBot() {
       return activeBots.has(botId) && entry.bot === bot;
     }
@@ -593,6 +574,31 @@ function startBot(
         `[botmanager] ❌ profile.onBotCreated threw for ${minecraftUser}:`,
         err.message
       );
+    }
+
+    // ── use_item sequence tracking ────────────────────────────────────────────
+    // In 1.19+, Paper servers validate that use_item packets carry a
+    // monotonically-increasing sequence number per connection. mineflayer's
+    // internal counter can fall out of sync (or not increment at all), causing
+    // "Invalid sequence" kicks when the bot tries to eat food.
+    //
+    // We install a thin write proxy HERE — after profile.onBotCreated — so
+    // our wrapper is the outermost layer and intercepts every use_item that
+    // mineflayer's bot.consume() sends, regardless of which profile is active.
+    //
+    // The counter resets to 0 on each new bot instance (each spawnBot call),
+    // matching the server's per-connection sequence state. Extra fields sent
+    // to older servers that don't have a sequence field are silently ignored
+    // by minecraft-protocol's packet serializer.
+    let useItemSequence = 0;
+    {
+      const _preSeqWrite = bot._client.write;
+      bot._client.write = function useItemSequencePatch(name, params) {
+        if (name === "use_item" && params != null) {
+          params = { ...params, sequence: useItemSequence++ };
+        }
+        return _preSeqWrite(name, params);
+      };
     }
 
     // ── Hunger ────────────────────────────────────────────────────────────────
@@ -635,8 +641,6 @@ function startBot(
 
       const e = activeBots.get(botId);
 
-      // Clear spawn timeout on first successful login for non-DonutSMP servers.
-      // DonutSMP leaves the outer timeout running until the verification window passes.
       if (profile.id !== "donutsmp" && e.spawnTimeoutId) {
         clearTimeout(e.spawnTimeoutId);
         e.spawnTimeoutId = null;
@@ -653,7 +657,6 @@ function startBot(
 
       saveToken(minecraftUser);
 
-      // Delegate to profile: post-login setup, callbacks, etc.
       try {
         profile.onLogin(bot, e, botId, spawnBot, {
           onLinkVerified,
@@ -683,10 +686,8 @@ function startBot(
 
       const e = activeBots.get(botId);
 
-      // Record for status reporting
       e.lastKickReason = reasonText;
 
-      // Delegate to profile first
       let profileHandled = false;
       try {
         const autoVersionState = { index: autoVersionIndex };
@@ -701,7 +702,6 @@ function startBot(
 
       if (profileHandled) return;
 
-      // Default: try version rotation on "outdated" kicks, then reconnect/stop
       if (autoMode && shouldRotateVersion(reasonText)) {
         autoVersionIndex++;
         if (autoVersionIndex < AUTO_VERSION_CANDIDATES.length) {
@@ -738,8 +738,6 @@ function startBot(
       const errCode = err.code;
       const errMessage = err.message || "";
 
-      // Delegate to profile first — profiles (e.g. DonutSmpProfile) may claim
-      // ownership of specific error codes such as ECONNRESET and EPIPE.
       let profileHandled = false;
       try {
         profileHandled = profile.onError(bot, e, botId, err, spawnBot);
@@ -749,11 +747,6 @@ function startBot(
 
       if (profileHandled) return;
 
-      // ── Transient socket reset (ECONNRESET / EPIPE) ──────────────────────
-      // The server forcibly closed the TCP connection. This is not a fatal
-      // error — it typically happens during server restarts or anti-bot
-      // handshakes on non-DonutSMP servers. Reconnect if AUTO_RECONNECT is
-      // enabled; otherwise clean up gracefully without alarming the user.
       if (isTransientSocketError(errCode)) {
         console.warn(
           `[botmanager] 🔌 Socket reset (${errCode}) for ${minecraftUser} — server closed the connection`
@@ -778,7 +771,6 @@ function startBot(
 
       console.error(`[botmanager] ❌ Bot error (${minecraftUser}):`, errMessage);
 
-      // Auth error dedup
       const isAuthError =
         errMessage.includes("invalid_grant") ||
         errMessage.includes("AADSTS") ||
@@ -808,7 +800,6 @@ function startBot(
         return;
       }
 
-      // Suppress stale keepalive timeout when already in a non-active state
       if (
         errMessage.includes("timed out") &&
         e.status !== "online" &&
@@ -843,12 +834,10 @@ function startBot(
       if (!isCurrentBot()) return;
       const e = activeBots.get(botId);
 
-      // Only act when in an active state; "reconnecting" means a retry is already scheduled
       if (e.status !== "online" && e.status !== "connecting") return;
 
       console.log(`[botmanager] 🔌 Bot disconnected (${minecraftUser}): ${reason}`);
 
-      // Delegate to profile first
       let profileHandled = false;
       try {
         profileHandled = profile.onEnd(bot, e, botId, reason, spawnBot);
@@ -858,7 +847,6 @@ function startBot(
 
       if (profileHandled) return;
 
-      // Default disconnect handling
       e.status = "error";
       e.spawnError = `Disconnected: ${reason}`;
 
@@ -933,13 +921,10 @@ function cleanupBot(botId, reason) {
     entry.spawnTimeoutId = null;
   }
 
-  // Remove from registry BEFORE destroying so events fired during destruction
-  // fail the isCurrentBot() / activeBots.has() checks and are silently dropped
   activeBots.delete(botId);
 
   recordEndedBot(entry, reason);
 
-  // Notify the profile so it can cancel its own pending timers/promises
   try {
     entry.profile.onCleanup(botId);
   } catch (_) {}
@@ -1004,9 +989,7 @@ function _entryToStatus(entry) {
     uptimeSeconds:  Math.floor(
       (Date.now() - new Date(entry.startedAt).getTime()) / 1000
     ),
-    // DonutSMP-specific
     donutSmpVerificationRetries: entry.donutSmpVerificationRetries || undefined,
-    // FreshSMP-specific
     freshSmpGamemode:   entry.freshSmpGamemode  || null,
     freshSmpQueueSent:  entry.freshSmpQueueSent || false,
   };
@@ -1020,11 +1003,9 @@ function sendFreshSmpQueueCommand(botId, gamemode) {
   const { profiles } = require("./afk-core/src/index");
   const freshSmpProfile = profiles.freshsmp;
 
-  // Try resolving the pending selection promise first
   const selectionResult = freshSmpProfile.selectGamemode(botId, gamemode);
   if (selectionResult.success) return selectionResult;
 
-  // Promise already resolved or bot is past the selection window — send directly
   return freshSmpProfile.sendQueueCommand(activeBots, botId, gamemode);
 }
 
