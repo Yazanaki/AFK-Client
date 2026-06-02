@@ -589,9 +589,16 @@ function startBot(
     //
     // Counter resets to 0 on each new bot instance (each spawnBot call),
     // matching the server's per-connection sequence state.
+    //
+    // IMPORTANT: _preSeqWrite MUST be bound to bot._client so that
+    // minecraft-protocol's internal writes (e.g. setProtocol handshake) have
+    // the correct `this` context when they call through this proxy. Without
+    // the bind, `this.serializer` is undefined in strict mode and throws a
+    // TypeError on connect for any profile that does not itself replace
+    // bot._client.write (e.g. FreshSMP, Default, Hypixel).
     let useItemSequence = 0;
     {
-      const _preSeqWrite = bot._client.write;
+      const _preSeqWrite = bot._client.write.bind(bot._client);
       bot._client.write = function useItemSequencePatch(name, params) {
         if (name === "use_item" && params != null) {
           params = {
