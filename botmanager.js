@@ -577,31 +577,45 @@ function startBot(
     }
 
     // ── use_item sequence tracking ────────────────────────────────────────────
-    // In 1.19+, Paper servers validate that use_item packets carry a
-    // monotonically-increasing sequence number per connection. mineflayer's
-    // internal counter can fall out of sync (or not increment at all), causing
-    // "Invalid sequence" kicks when the bot tries to eat food.
+    // In 1.19+, Paper servers (e.g. DonutSMP) validate that use_item carries
+    // a monotonically-increasing sequence number per connection. We intercept
+    // every use_item write here — outermost layer, after all profile proxies —
+    // to guarantee the sequence is always correct.
     //
-    // We install a thin write proxy HERE — after profile.onBotCreated — so
-    // our wrapper is the outermost layer and intercepts every use_item that
-    // mineflayer's bot.consume() sends, regardless of which profile is active.
+    // In 1.21.2+, use_item also requires yaw and pitch fields. We inject
+    // defaults from bot.entity here so the packet is never malformed even if
+    // the caller (mineflayer or our own code) omits them. Older servers that
+    // don't have these fields in their schema silently ignore them.
     //
-    // The counter resets to 0 on each new bot instance (each spawnBot call),
-    // matching the server's per-connection sequence state. Extra fields sent
-    // to older servers that don't have a sequence field are silently ignored
-    // by minecraft-protocol's packet serializer.
+    // Counter resets to 0 on each new bot instance (each spawnBot call),
+    // matching the server's per-connection sequence state.
     let useItemSequence = 0;
     {
       const _preSeqWrite = bot._client.write;
       bot._client.write = function useItemSequencePatch(name, params) {
         if (name === "use_item" && params != null) {
-          params = { ...params, sequence: useItemSequence++ };
+          params = {
+            ...params,
+            sequence: useItemSequence++,
+            // 1.21.2+ requires yaw & pitch; supply from bot entity if absent
+            yaw:   params.yaw   !== undefined ? params.yaw   : (bot.entity?.yaw   ?? 0),
+            pitch: params.pitch !== undefined ? params.pitch : (bot.entity?.pitch ?? 0),
+          };
         }
         return _preSeqWrite(name, params);
       };
     }
 
     // ── Hunger ────────────────────────────────────────────────────────────────
+    // We write use_item directly instead of calling bot.consume() because:
+    //   1. bot.consume() may silently throw before the write (e.g. if
+    //      bot.heldItem is momentarily null after equip), meaning no packet
+    //      is ever sent and the bot slowly starves.
+    //   2. bot.consume()'s internal state machine can call activateItem() with
+    //      a stale or incorrectly formatted packet for 1.21.2+ protocol.
+    // Writing the packet directly lets our sequence/yaw/pitch proxy above
+    // handle everything cleanly. The server's inventory and health update
+    // packets keep mineflayer's state correct regardless.
     async function tryEat() {
       if (isEating || Date.now() < eatCooldownUntil) return;
       if (!isCurrentBot()) return;
@@ -615,13 +629,14 @@ function startBot(
       isEating = true;
       try {
         await bot.equip(foodItem, "hand");
-        await bot.consume();
+        // Write use_item directly — the proxy above injects sequence/yaw/pitch
+        bot._client.write("use_item", { hand: 0 });
         eatCooldownUntil = Date.now() + 1500;
         console.log(
           `[botmanager] 🍖 ${minecraftUser} ate ${foodItem.name} (food: ${bot.food}/20)`
         );
-      } catch {
-        // Ignore eating errors — not critical
+      } catch (err) {
+        console.warn(`[botmanager] ⚠️ Eat failed for ${minecraftUser}:`, err.message);
       } finally {
         isEating = false;
       }
