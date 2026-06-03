@@ -49,6 +49,11 @@ class FreshSmpProfile extends BaseProfile {
     // Without it, the server logs an internal error and kicks the client with
     // "SERVER ERROR — An internal error occurred in your connection."
     //
+    // IMPORTANT: enableServerListing was removed from the 1.21.5+ protocol
+    // schema. Including it causes the serializer to throw silently, meaning
+    // no settings packet is ever sent — which is exactly what triggers the
+    // SERVER ERROR kick. Do NOT add it back.
+    //
     // particleStatus (0=minimal, 1=decreased, 2=all) is required for 1.21.3+.
     // The field is silently ignored by the serializer on older versions, so
     // it is safe to include unconditionally.
@@ -63,7 +68,6 @@ class FreshSmpProfile extends BaseProfile {
           skinParts:           127,
           mainHand:            1,
           enableTextFiltering: false,
-          enableServerListing: true,
           particleStatus:      2,
         });
         console.log(`[FreshSmpProfile] ✅ [${entry.minecraftUser}] Client settings sent`);

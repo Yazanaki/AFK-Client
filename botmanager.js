@@ -320,12 +320,22 @@ function shouldRotateVersion(reasonText) {
 /**
  * Forcibly destroy a mineflayer bot instance, stopping all timers and
  * closing the underlying socket. Safe to call multiple times.
+ *
+ * We remove all listeners AFTER closing the connection so that quit/end
+ * can complete normally with their internal handlers intact, but the
+ * freed EventEmitter slots prevent the MaxListenersExceededWarning from
+ * accumulating across rapid reconnect cycles.
  */
 function hardDestroyBot(bot) {
   if (!bot) return;
   try { bot.quit(); } catch (_) {}
   try { bot._client?.end(); } catch (_) {}
   try { bot._client?.socket?.destroy(); } catch (_) {}
+  // Remove listeners after closing — prevents ghost listener accumulation
+  // on rapid reconnects (e.g. repeated SERVER ERROR kicks triggering
+  // AUTO_RECONNECT, which causes the MaxListenersExceededWarning).
+  try { bot.removeAllListeners(); } catch (_) {}
+  try { bot._client?.removeAllListeners(); } catch (_) {}
 }
 
 // ============================================================
@@ -559,6 +569,15 @@ function startBot(
       cleanupBot(botId, "create_error");
       return;
     }
+
+    // ── Increase listener limit ───────────────────────────────────────────────
+    // mineflayer and minecraft-protocol register many internal listeners for
+    // configuration-phase packets (e.g. code_of_conduct, registry_data, etc.).
+    // The default limit of 10 can be hit on servers that repeatedly reconnect
+    // (e.g. AUTO_RECONNECT with a fast kick cycle). Raising it here prevents
+    // false-positive MaxListenersExceededWarning noise in the logs.
+    try { bot.setMaxListeners(50); } catch (_) {}
+    try { if (bot._client) bot._client.setMaxListeners(50); } catch (_) {}
 
     entry.bot = bot;
 
