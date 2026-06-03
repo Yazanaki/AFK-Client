@@ -29,7 +29,33 @@ class FreshSmpProfile extends BaseProfile {
     this._antiAfkTimers   = new Map();
   }
 
+  // ── Disable minecraft-protocol's built-in keep-alive handler ─────────────────
+  // minecraft-protocol's internal keepalive.js sends its own keep_alive echo and
+  // runs a 30-second timeout. We handle keep_alive manually in onBotCreated, so
+  // we must set keepAlive: false to prevent the two handlers from conflicting —
+  // otherwise the internal timeout fires after ~30s and kicks the bot with
+  // "client timed out after 30000 milliseconds".
+  buildClientOptions(base) {
+    return {
+      ...base,
+      keepAlive: false,
+    };
+  }
+
   onBotCreated(bot, entry, botId, spawnBot) {
+    // ── Manual Minecraft keep-alive echo ─────────────────────────────────────
+    // Required because keepAlive: false disables minecraft-protocol's built-in
+    // handler. The server expects the client to echo keep_alive packets within
+    // ~30 seconds or it disconnects with "Timed out".
+    // We write directly on bot._client (pre-any-proxy) to guarantee delivery.
+    bot._client.on("keep_alive", (packet) => {
+      try {
+        bot._client.write("keep_alive", { keepAliveId: packet.keepAliveId });
+      } catch (_) {
+        // Session is closing — ignore.
+      }
+    });
+
     bot._client.on("ping", (packet) => {
       try { bot._client.write("pong", { id: packet.id }); } catch (_) {}
     });
