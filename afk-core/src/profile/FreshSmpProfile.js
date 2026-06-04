@@ -42,10 +42,10 @@ const FRESHSMP_GAMEMODES = {
  * commonly omitted by mineflayer's internal auto-send.
  *
  * packetName: "settings" in PLAY state, "client_information" in CONFIGURATION
- * state (Velocity server transfers). The write interceptor in onBotCreated
- * patches both names, so this function only needs to send one — but we try
- * "client_information" first (which works in both states on 1.20.2+ protocol)
- * and fall back to "settings" if it throws.
+ * state (Velocity server transfers). We MUST pick the name that matches the
+ * connection's CURRENT state — sending a configuration-state packet while in
+ * play state (or vice versa) produces a malformed packet that Canvas rejects
+ * with a generic SERVER ERROR kick. client.state tells us which state we're in.
  */
 function sendClientSettings(client) {
   const payload = {
@@ -59,12 +59,9 @@ function sendClientSettings(client) {
     enableServerListing:  true,
     particleStatus:       0,
   };
-  // Try configuration-state name first; fall back to play-state name.
-  try {
-    client.write("client_information", payload);
-  } catch (_) {
-    client.write("settings", payload);
-  }
+  // Pick the packet name that matches the current connection state.
+  const name = client.state === "configuration" ? "client_information" : "settings";
+  client.write(name, payload);
 }
 
 class FreshSmpProfile extends BaseProfile {
