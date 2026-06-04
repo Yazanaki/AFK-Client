@@ -20,6 +20,12 @@ const ANTI_AFK_RETURN_DELAY_MS = 1500;
 // settings. This is belt-and-suspenders on top of the write interceptor below.
 const TRANSFER_SETTINGS_DELAY_MS = 500;
 
+// Forensic packet logging. Set FRESHSMP_DEBUG=forensic to log every outgoing
+// and incoming packet (with the current connection state) so we can identify
+// exactly which packet triggers a SERVER ERROR kick during a server transfer.
+const FRESHSMP_DEBUG =
+  String(process.env.FRESHSMP_DEBUG || "minimal").toLowerCase() === "forensic";
+
 const FRESHSMP_GAMEMODES = {
   survival:  "survival",
   lifesteal: "lifesteal",
@@ -133,8 +139,27 @@ class FreshSmpProfile extends BaseProfile {
         };
         console.log(`[FreshSmpProfile] ⚙️ [${entry.minecraftUser}] ${name} intercepted → fields ensured`);
       }
+      if (FRESHSMP_DEBUG) {
+        const st = bot._client.state;
+        try {
+          console.log(`[fresh-pkt] → CLIENT sent [${st}]: ${name}`, JSON.stringify(params).slice(0, 160));
+        } catch {
+          console.log(`[fresh-pkt] → CLIENT sent [${st}]: ${name} (non-serializable)`);
+        }
+      }
       return _origWrite(name, params);
     };
+
+    // ── Incoming packet logger (forensic mode only) ──────────────────────────
+    if (FRESHSMP_DEBUG) {
+      bot._client.on("packet", (data, meta) => {
+        try {
+          console.log(`[fresh-pkt] ← SERVER [${meta.state}]: ${meta.name}`, JSON.stringify(data).slice(0, 160));
+        } catch {
+          console.log(`[fresh-pkt] ← SERVER [${meta.state}]: ${meta.name} (binary)`);
+        }
+      });
+    }
 
     // ── Manual Minecraft keep-alive echo ─────────────────────────────────────
     // Required because keepAlive: false disables minecraft-protocol's built-in
