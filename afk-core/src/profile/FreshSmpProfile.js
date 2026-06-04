@@ -16,8 +16,8 @@ const ANTI_AFK_YAW_DELTA_MIN   = 2;
 const ANTI_AFK_YAW_DELTA_MAX   = 8;
 const ANTI_AFK_RETURN_DELAY_MS = 1500;
 
-// Delay (ms) after a proxy server transfer before re-sending client settings.
-// Gives the sub-server a moment to finish its login sequence before we write.
+// Delay (ms) after a proxy server transfer before explicitly re-sending client
+// settings. This is belt-and-suspenders on top of the write interceptor below.
 const TRANSFER_SETTINGS_DELAY_MS = 500;
 
 const FRESHSMP_GAMEMODES = {
@@ -27,16 +27,19 @@ const FRESHSMP_GAMEMODES = {
 };
 
 /**
- * Build and send the client settings packet.
+ * Build and write the correct client settings packet.
+ *
  * Required fields for 1.21.11 (verified against minecraft-data protocol.json):
  *   locale, viewDistance, chatFlags, chatColors, skinParts, mainHand,
  *   enableTextFiltering, enableServerListing, particleStatus
  *
  * NOTE: enableServerListing is required in 1.21.3+ schemas. Omitting it
- * causes the serializer to throw silently — no settings packet is sent —
- * which triggers the SERVER ERROR kick on Paper-based servers.
+ * causes the serializer to throw silently — no packet is sent — which
+ * triggers SERVER ERROR kicks on Paper-based / Canvas servers.
  *
  * particleStatus mappings: 0=all, 1=decreased, 2=minimal
+ * This field is also required in 1.21.3+ schemas and is the field most
+ * commonly omitted by mineflayer's internal auto-send.
  */
 function sendClientSettings(client) {
   client.write("settings", {
@@ -73,43 +76,86 @@ class FreshSmpProfile extends BaseProfile {
   }
 
   onBotCreated(bot, entry, botId, spawnBot) {
+
+    // ── Settings write interceptor ────────────────────────────────────────────
+    // mineflayer automatically sends a client_information ("settings") packet
+    // on login. In mineflayer 4.x for 1.21.x, this auto-sent packet may omit
+    // `particleStatus`, which is required by the 1.21.3+ protocol schema.
+    // Canvas (and Paper) throw an internal exception when this field is missing,
+    // producing a SERVER ERROR kick.
+    //
+    // By intercepting ALL writes at the profile level (before botmanager's
+    // use_item patch is applied), we guarantee that every "settings" packet —
+    // whether sent by mineflayer internally, by onLogin, or by the transfer
+    // listener below — always carries the full set of required fields.
+    //
+    // Fields are merged with defaults so any value the caller explicitly sets
+    // is preserved; only genuinely missing fields are filled in.
+    //
+    // IMPORTANT: botmanager.js applies its own write proxy (use_item sequence)
+    // AFTER onBotCreated returns. The final write chain is therefore:
+    //   bot._client.write
+    //     → useItemSequencePatch  (botmanager, applied after)
+    //     → freshSmpSettingsPatch (this, applied now)
+    //     → original write
+    // Both patches operate on different packet names and do not interfere.
+    const _origWrite = bot._client.write.bind(bot._client);
+    bot._client.write = function freshSmpSettingsPatch(name, params) {
+      if (name === "settings") {
+        // Merge caller params over our safe defaults so nothing is silently lost,
+        // then hard-force particleStatus which is the known missing field.
+        params = {
+          locale:               (params && params.locale              != null) ? params.locale              : "en_US",
+          viewDistance:         (params && params.viewDistance        != null) ? params.viewDistance        : 8,
+          chatFlags:            (params && params.chatFlags           != null) ? params.chatFlags           : 0,
+          chatColors:           (params && params.chatColors          != null) ? params.chatColors          : true,
+          skinParts:            (params && params.skinParts           != null) ? params.skinParts           : 127,
+          mainHand:             (params && params.mainHand            != null) ? params.mainHand            : 1,
+          enableTextFiltering:  (params && params.enableTextFiltering != null) ? params.enableTextFiltering : false,
+          enableServerListing:  (params && params.enableServerListing != null) ? params.enableServerListing : true,
+          particleStatus:       0, // hard-force; required in 1.21.3+ schemas
+        };
+      }
+      return _origWrite(name, params);
+    };
+
     // ── Manual Minecraft keep-alive echo ─────────────────────────────────────
     // Required because keepAlive: false disables minecraft-protocol's built-in
     // handler. The server expects the client to echo keep_alive packets within
     // ~30 seconds or it disconnects with "Timed out".
+    //
+    // Uses _origWrite (pre-patch) to guarantee the echo bypasses our settings
+    // interceptor (which is irrelevant here but avoids any future ambiguity).
     bot._client.on("keep_alive", (packet) => {
       try {
-        bot._client.write("keep_alive", { keepAliveId: packet.keepAliveId });
+        _origWrite("keep_alive", { keepAliveId: packet.keepAliveId });
       } catch (_) {
         // Session is closing — ignore.
       }
     });
 
     bot._client.on("ping", (packet) => {
-      try { bot._client.write("pong", { id: packet.id }); } catch (_) {}
+      try { _origWrite("pong", { id: packet.id }); } catch (_) {}
     });
 
-    // ── Client settings on every server transfer ──────────────────────────────
-    // FreshSMP is a BungeeCord/Velocity proxy network. When the bot is
-    // transferred from the lobby to a sub-server (e.g. survival) the server
-    // sends a new `login` packet down the SAME TCP connection. Paper requires
-    // the client to re-send its settings packet at the start of each sub-server
-    // session — if it is missing, Paper kicks with "SERVER ERROR".
+    // ── Client settings on every proxy server transfer ────────────────────────
+    // FreshSMP is a Velocity proxy network. When the bot is transferred from one
+    // sub-server to another (lobby → queue → survival) the proxy sends a new
+    // `login` packet down the SAME TCP connection. Each sub-server requires the
+    // client to send a fresh settings packet during its login sequence.
     //
     // botmanager.js uses bot.once("login", ...) so profile.onLogin is only
-    // called for the very first login. All subsequent proxy transfers are
-    // handled here by listening to the raw client-level login packet.
+    // called for the very first login. All proxy transfers are handled here by
+    // listening on the raw client-level login packet.
     //
-    // We skip loginFireCount === 1 because onLogin already sends settings
-    // for the initial connection (via its own setTimeout). Transfers 2, 3, …
-    // are server hops that need a fresh settings send.
+    // The settings write below is redundant with the interceptor above (the
+    // interceptor ensures mineflayer's own auto-send is already correct), but
+    // keeps this an explicit, debuggable action that appears in PM2 logs.
     let _loginFireCount = 0;
     bot._client.on("login", () => {
       _loginFireCount++;
-      if (_loginFireCount === 1) return; // handled by onLogin
+      if (_loginFireCount === 1) return; // initial login handled by onLogin
 
-      // This is a proxy server transfer — re-send settings after a brief delay
-      // so the sub-server finishes its own login sequence first.
       setTimeout(() => {
         if (!bot || bot._client?.ended) return;
         try {
@@ -135,7 +181,9 @@ class FreshSmpProfile extends BaseProfile {
   }
 
   onLogin(bot, entry, botId, spawnBot, callbacks) {
-    // Send client settings explicitly for the initial login in play state.
+    // Explicitly send client settings for the initial login.
+    // The write interceptor applied in onBotCreated guarantees that even
+    // mineflayer's own auto-send will be correct, so this is belt-and-suspenders.
     // Subsequent server transfers are handled by the bot._client.on("login")
     // listener registered in onBotCreated above.
     setTimeout(() => {
