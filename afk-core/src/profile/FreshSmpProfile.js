@@ -40,9 +40,15 @@ const FRESHSMP_GAMEMODES = {
  * particleStatus mappings: 0=all, 1=decreased, 2=minimal
  * This field is also required in 1.21.3+ schemas and is the field most
  * commonly omitted by mineflayer's internal auto-send.
+ *
+ * packetName: "settings" in PLAY state, "client_information" in CONFIGURATION
+ * state (Velocity server transfers). The write interceptor in onBotCreated
+ * patches both names, so this function only needs to send one — but we try
+ * "client_information" first (which works in both states on 1.20.2+ protocol)
+ * and fall back to "settings" if it throws.
  */
 function sendClientSettings(client) {
-  client.write("settings", {
+  const payload = {
     locale:               "en_US",
     viewDistance:         8,
     chatFlags:            0,
@@ -52,7 +58,13 @@ function sendClientSettings(client) {
     enableTextFiltering:  false,
     enableServerListing:  true,
     particleStatus:       0,
-  });
+  };
+  // Try configuration-state name first; fall back to play-state name.
+  try {
+    client.write("client_information", payload);
+  } catch (_) {
+    client.write("settings", payload);
+  }
 }
 
 class FreshSmpProfile extends BaseProfile {
@@ -101,9 +113,16 @@ class FreshSmpProfile extends BaseProfile {
     // Both patches operate on different packet names and do not interfere.
     const _origWrite = bot._client.write.bind(bot._client);
     bot._client.write = function freshSmpSettingsPatch(name, params) {
-      if (name === "settings") {
-        // Merge caller params over our safe defaults so nothing is silently lost,
-        // then hard-force particleStatus which is the known missing field.
+      // minecraft-protocol names the ClientInformation packet differently depending
+      // on the connection state:
+      //   PLAY state         → "settings"
+      //   CONFIGURATION state → "client_information"
+      // Both require the same full field set in 1.21.3+. When Velocity does a
+      // server transfer it puts the connection back into CONFIGURATION state, so
+      // mineflayer's auto-send uses "client_information" — NOT "settings" — and
+      // omits particleStatus/enableServerListing, causing a SERVER ERROR kick.
+      // We guard both names here to cover both states.
+      if (name === "settings" || name === "client_information") {
         params = {
           locale:               (params && params.locale              != null) ? params.locale              : "en_US",
           viewDistance:         (params && params.viewDistance        != null) ? params.viewDistance        : 8,
@@ -115,6 +134,7 @@ class FreshSmpProfile extends BaseProfile {
           enableServerListing:  (params && params.enableServerListing != null) ? params.enableServerListing : true,
           particleStatus:       0, // hard-force; required in 1.21.3+ schemas
         };
+        console.log(`[FreshSmpProfile] ⚙️ [${entry.minecraftUser}] ${name} intercepted → fields ensured`);
       }
       return _origWrite(name, params);
     };
