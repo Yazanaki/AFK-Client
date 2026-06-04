@@ -10,6 +10,11 @@ const VERIFICATION_RECONNECT_DELAY_MS = 5000;
 const VERIFICATION_WINDOW_SECONDS = 60;
 const MID_SESSION_RECONNECT_DELAY_MS = 8000;
 
+// "Already online" means the previous session is still alive server-side.
+// Wait longer so the server has time to time out the old connection before
+// we reconnect (Minecraft servers typically take 10-30s to clear a ghost session).
+const ALREADY_ONLINE_RECONNECT_DELAY_MS = 20000;
+
 // Anti-AFK head rotation timings
 const ANTI_AFK_MIN_MS = 3 * 60 * 1000;
 const ANTI_AFK_MAX_MS = 6 * 60 * 1000;
@@ -150,6 +155,29 @@ class DonutSmpProfile extends BaseProfile {
   onSpawn(bot, entry, botId) {}
 
   onKick(bot, entry, botId, reasonText, spawnBot, autoMode, candidates, autoVersionState) {
+    const r = (reasonText || "").toLowerCase();
+
+    // "Already online" means our previous session is still alive on the server.
+    // Wait long enough for the server to clear the ghost session before retrying.
+    if (r.includes("already online")) {
+      entry.donutSmpVerificationRetries = (entry.donutSmpVerificationRetries || 0) + 1;
+      if (entry.donutSmpVerificationRetries > MAX_VERIFICATION_RETRIES) {
+        console.error(`[DonutSmpProfile] ❌ [${entry.minecraftUser}] Retry limit reached on "already online" — giving up`);
+        entry.status = "error";
+        entry.errorCategory = "donutsmp_verification";
+        entry.spawnError = "DonutSMP reported 'already online' too many times. Please verify your account via the DonutSMP Discord bot, then try /mcbot start again.";
+        return true;
+      }
+      console.log(
+        `[DonutSmpProfile] 🟠 [${entry.minecraftUser}] "Already online" kick — ` +
+        `waiting ${ALREADY_ONLINE_RECONNECT_DELAY_MS}ms for ghost session to clear ` +
+        `(attempt ${entry.donutSmpVerificationRetries}/${MAX_VERIFICATION_RETRIES})`
+      );
+      entry.status = "reconnecting";
+      setTimeout(() => spawnBot(DONUTSMP_VERSION), ALREADY_ONLINE_RECONNECT_DELAY_MS);
+      return true;
+    }
+
     if (DonutSmpProfile.isVerificationKick(reasonText)) {
       console.log(
         `[DonutSmpProfile] 🔐 [${entry.minecraftUser}] Verification kick detected — scheduling reconnect`
@@ -288,7 +316,10 @@ class DonutSmpProfile extends BaseProfile {
       r.includes("confirm it via") ||
       r.includes("discord dms") ||
       r.includes("direct messages enabled") ||
-      r.includes("donutsmp")
+      r.includes("donutsmp") ||
+      // Paper rejects connections with bad packet sequence numbers during the
+      // auth/login window; treat it as transient and retry like other verification kicks.
+      r.includes("invalid sequence")
     );
   }
 

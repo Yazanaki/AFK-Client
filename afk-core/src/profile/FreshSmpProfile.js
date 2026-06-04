@@ -138,6 +138,21 @@ class FreshSmpProfile extends BaseProfile {
       try { _origWrite("pong", { id: packet.id }); } catch (_) {}
     });
 
+    // ── Cookie request (Velocity 1.20.5+) ────────────────────────────────────
+    // Velocity proxies can send a cookie_request packet during login. The client
+    // must respond with cookie_response (even if empty) or the proxy drops the
+    // connection with a SERVER ERROR kick. mineflayer does not handle this
+    // automatically, so we echo an empty response for every cookie requested.
+    bot._client.on("cookie_request", (packet) => {
+      try {
+        _origWrite("cookie_response", {
+          key:     packet.key,
+          payload: null,
+        });
+        console.log(`[FreshSmpProfile] 🍪 [${entry.minecraftUser}] cookie_response sent for key=${packet.key}`);
+      } catch (_) {}
+    });
+
     // ── Client settings on every proxy server transfer ────────────────────────
     // FreshSMP is a Velocity proxy network. When the bot is transferred from one
     // sub-server to another (lobby → queue → survival) the proxy sends a new
@@ -210,14 +225,11 @@ class FreshSmpProfile extends BaseProfile {
   onKick(bot, entry, botId, reasonText, spawnBot, autoMode, candidates, autoVersionState) {
     const lower = (reasonText || "").toLowerCase();
 
-    // Log FreshSMP's "SERVER ERROR" kick specifically so it is easy to spot
-    // in PM2 logs. The error category is set so botmonitor can surface it.
-    // Return false — botmanager handles cleanup/reconnect via AUTO_RECONNECT.
     if (lower.includes("server error") || lower.includes("internal error")) {
       console.warn(
         `[FreshSmpProfile] ⚠️ [${entry?.minecraftUser}] SERVER ERROR kick — ` +
         `FreshSMP rejected the connection (malformed or missing packet). ` +
-        `Check PM2 logs for serialization errors above this line.`
+        `Raw reason: ${reasonText}`
       );
       if (entry) entry.errorCategory = "freshsmp_server_error";
     }
