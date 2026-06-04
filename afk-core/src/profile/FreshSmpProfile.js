@@ -116,6 +116,28 @@ class FreshSmpProfile extends BaseProfile {
     // Both patches operate on different packet names and do not interfere.
     const _origWrite = bot._client.write.bind(bot._client);
     bot._client.write = function freshSmpSettingsPatch(name, params) {
+      // ── Drop movement packets during CONFIGURATION state ───────────────────
+      // When /queue triggers a Velocity server transfer, the server sends
+      // start_configuration and the connection re-enters CONFIGURATION state.
+      // mineflayer's physics loop keeps ticking and fires movement packets
+      // (flying / position / look / position_look) which are PLAY-state packets
+      // and are INVALID during configuration. The vanilla client never sends
+      // movement while configuring; Canvas treats the unexpected packet as
+      // malformed and kicks with a generic SERVER ERROR.
+      //
+      // Suppressing these only while in configuration state lets the transfer
+      // handshake complete cleanly, after which normal play-state movement
+      // (which the server expects) resumes untouched.
+      if (
+        bot._client.state === "configuration" &&
+        (name === "position" || name === "position_look" || name === "look" || name === "flying")
+      ) {
+        if (FRESHSMP_DEBUG) {
+          console.log(`[fresh-pkt] → DROPPED ${name} (movement during configuration state)`);
+        }
+        return;
+      }
+
       // minecraft-protocol names the ClientInformation packet differently depending
       // on the connection state:
       //   PLAY state         → "settings"
