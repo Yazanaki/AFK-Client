@@ -213,42 +213,44 @@ class FreshSmpProfile extends BaseProfile {
       } catch (_) {}
     });
 
-    // ── Client settings on entering CONFIGURATION state ───────────────────────
-    // FreshSMP is a Velocity proxy network. When the bot is transferred between
-    // sub-servers (lobby → queue → survival) the connection re-enters the
-    // CONFIGURATION state and the client must re-send client_information.
+    // ── Client settings re-sent in PLAY after a server transfer ───────────────
+    // CRITICAL ORDERING NOTE (learned from forensic packet traces):
     //
-    // TIMING IS CRITICAL. A vanilla client sends client_information as the FIRST
-    // packet upon entering configuration, before responding to select_known_packs.
-    // The previous implementation used a 500ms-delayed send tied to the play-state
-    // "login" event, which fired client_information LATE — in the middle of the
-    // server's registry_data stream. Pipeline (FreshSMP's server software) rejects
-    // that out-of-order packet with a generic "SERVER ERROR / internal error
-    // caused by you" kick the instant the play state begins on the new server.
+    // We must NOT send client_information during the CONFIGURATION state. The
+    // working initial-login handshake never does — it only responds to
+    // select_known_packs and finish_configuration during config, then sends
+    // settings once it reaches PLAY. Every transfer attempt that sent
+    // client_information during configuration was kicked by Pipeline (FreshSMP's
+    // server software) with a generic "SERVER ERROR / internal error caused by
+    // you" — whether sent early (kicked right after known_packs) or late (kicked
+    // on entering play). Pipeline throws when it receives client_information mid-
+    // configuration on a backend transfer.
     //
-    // We instead listen for the actual state transition and send immediately, so
-    // the ordering matches a vanilla client. The write interceptor above still
-    // guarantees the full field set is present.
-    // _configEntryCount distinguishes the initial login's configuration phase
-    // (count 1 — mineflayer auto-sends client_information itself, so we must NOT
-    // duplicate it) from later transfer configuration phases (count 2+ — mineflayer
-    // does NOT auto-send, so we must).
-    let _configEntryCount = 0;
+    // So we replicate the working pattern: do nothing during config (mineflayer's
+    // built-in handler responds to select_known_packs / finish_configuration on
+    // its own), and re-send settings only once we are back in PLAY state on the
+    // new sub-server. _playEntryCount > 1 means a transfer completed (the first
+    // PLAY entry is the initial login, already handled by onLogin).
+    let _playEntryCount = 0;
     bot._client.on("state", (newState) => {
-      if (newState !== "configuration") return;
-      _configEntryCount++;
-      if (_configEntryCount === 1) return; // initial login — mineflayer handles it
-      try {
-        sendClientSettings(bot._client); // picks "client_information" in config state
-        console.log(
-          `[FreshSmpProfile] ⚙️ [${entry.minecraftUser}] client_information sent on entering configuration (transfer #${_configEntryCount - 1})`
-        );
-      } catch (err) {
-        console.warn(
-          `[FreshSmpProfile] ⚠️ [${entry.minecraftUser}] Could not send client_information in configuration state:`,
-          err.message
-        );
-      }
+      if (newState !== "play") return;
+      _playEntryCount++;
+      if (_playEntryCount === 1) return; // initial login — handled by onLogin
+      // Small delay so the server finishes its own play-state join sequence first.
+      setTimeout(() => {
+        if (!bot || bot._client?.ended || bot._client.state !== "play") return;
+        try {
+          sendClientSettings(bot._client); // picks "settings" in play state
+          console.log(
+            `[FreshSmpProfile] ✅ [${entry.minecraftUser}] settings re-sent in play after transfer #${_playEntryCount - 1}`
+          );
+        } catch (err) {
+          console.warn(
+            `[FreshSmpProfile] ⚠️ [${entry.minecraftUser}] Could not re-send settings after transfer:`,
+            err.message
+          );
+        }
+      }, 1000);
     });
 
     // ── Anti-AFK — start scheduling after login ───────────────────────────────
