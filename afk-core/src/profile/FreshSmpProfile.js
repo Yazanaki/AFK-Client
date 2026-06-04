@@ -16,11 +16,41 @@ const ANTI_AFK_YAW_DELTA_MIN   = 2;
 const ANTI_AFK_YAW_DELTA_MAX   = 8;
 const ANTI_AFK_RETURN_DELAY_MS = 1500;
 
+// Delay (ms) after a proxy server transfer before re-sending client settings.
+// Gives the sub-server a moment to finish its login sequence before we write.
+const TRANSFER_SETTINGS_DELAY_MS = 500;
+
 const FRESHSMP_GAMEMODES = {
   survival:  "survival",
   lifesteal: "lifesteal",
   skywars:   "skywars",
 };
+
+/**
+ * Build and send the client settings packet.
+ * Required fields for 1.21.11 (verified against minecraft-data protocol.json):
+ *   locale, viewDistance, chatFlags, chatColors, skinParts, mainHand,
+ *   enableTextFiltering, enableServerListing, particleStatus
+ *
+ * NOTE: enableServerListing is required in 1.21.3+ schemas. Omitting it
+ * causes the serializer to throw silently — no settings packet is sent —
+ * which triggers the SERVER ERROR kick on Paper-based servers.
+ *
+ * particleStatus mappings: 0=all, 1=decreased, 2=minimal
+ */
+function sendClientSettings(client) {
+  client.write("settings", {
+    locale:               "en_US",
+    viewDistance:         8,
+    chatFlags:            0,
+    chatColors:           true,
+    skinParts:            127,
+    mainHand:             1,
+    enableTextFiltering:  false,
+    enableServerListing:  true,
+    particleStatus:       0,
+  });
+}
 
 class FreshSmpProfile extends BaseProfile {
   constructor() {
@@ -59,41 +89,60 @@ class FreshSmpProfile extends BaseProfile {
       try { bot._client.write("pong", { id: packet.id }); } catch (_) {}
     });
 
-    // Schedule anti-AFK after login so bot.entity is populated with a valid
-    // yaw/pitch. The timer fires 3-6 minutes later and self-reschedules,
-    // keeping the bot alive through both lobby waiting and post-queue time.
+    // ── Client settings on every server transfer ──────────────────────────────
+    // FreshSMP is a BungeeCord/Velocity proxy network. When the bot is
+    // transferred from the lobby to a sub-server (e.g. survival) the server
+    // sends a new `login` packet down the SAME TCP connection. Paper requires
+    // the client to re-send its settings packet at the start of each sub-server
+    // session — if it is missing, Paper kicks with "SERVER ERROR".
+    //
+    // botmanager.js uses bot.once("login", ...) so profile.onLogin is only
+    // called for the very first login. All subsequent proxy transfers are
+    // handled here by listening to the raw client-level login packet.
+    //
+    // We skip loginFireCount === 1 because onLogin already sends settings
+    // for the initial connection (via its own setTimeout). Transfers 2, 3, …
+    // are server hops that need a fresh settings send.
+    let _loginFireCount = 0;
+    bot._client.on("login", () => {
+      _loginFireCount++;
+      if (_loginFireCount === 1) return; // handled by onLogin
+
+      // This is a proxy server transfer — re-send settings after a brief delay
+      // so the sub-server finishes its own login sequence first.
+      setTimeout(() => {
+        if (!bot || bot._client?.ended) return;
+        try {
+          sendClientSettings(bot._client);
+          console.log(
+            `[FreshSmpProfile] ✅ [${entry.minecraftUser}] Client settings re-sent after server transfer (hop #${_loginFireCount})`
+          );
+        } catch (err) {
+          console.warn(
+            `[FreshSmpProfile] ⚠️ [${entry.minecraftUser}] Could not re-send client settings after transfer:`,
+            err.message
+          );
+        }
+      }, TRANSFER_SETTINGS_DELAY_MS);
+    });
+
+    // ── Anti-AFK — start scheduling after login ───────────────────────────────
+    // Wait for login so bot.entity is populated with a valid yaw/pitch, and so
+    // we don't send look packets during the pre-login security screen.
     bot.once("login", () => {
       this._scheduleAntiAfk(botId, entry, bot);
     });
   }
 
   onLogin(bot, entry, botId, spawnBot, callbacks) {
-    // Send client settings explicitly in play state.
-    //
-    // FreshSMP (Paper 1.21.11) expects all fields of packet_common_settings.
-    // Missing any field causes the serializer to throw silently, meaning no
-    // settings packet is sent at all — which triggers the SERVER ERROR kick.
-    //
-    // Required fields for 1.21.11 (verified against minecraft-data protocol.json):
-    //   locale, viewDistance, chatFlags, chatColors, skinParts, mainHand,
-    //   enableTextFiltering, enableServerListing, particleStatus
-    //
-    // particleStatus mappings: 0=all, 1=decreased, 2=minimal
+    // Send client settings explicitly for the initial login in play state.
+    // Subsequent server transfers are handled by the bot._client.on("login")
+    // listener registered in onBotCreated above.
     setTimeout(() => {
       if (!bot || bot._client?.ended) return;
       try {
-        bot._client.write("settings", {
-          locale:               "en_US",
-          viewDistance:         8,
-          chatFlags:            0,
-          chatColors:           true,
-          skinParts:            127,
-          mainHand:             1,
-          enableTextFiltering:  false,
-          enableServerListing:  true,
-          particleStatus:       0,
-        });
-        console.log(`[FreshSmpProfile] ✅ [${entry.minecraftUser}] Client settings sent`);
+        sendClientSettings(bot._client);
+        console.log(`[FreshSmpProfile] ✅ [${entry.minecraftUser}] Client settings sent (initial login)`);
       } catch (err) {
         console.warn(
           `[FreshSmpProfile] ⚠️ [${entry.minecraftUser}] Could not send client settings:`,
