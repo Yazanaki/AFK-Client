@@ -33,7 +33,7 @@ class FreshSmpProfile extends BaseProfile {
   // minecraft-protocol's internal keepalive.js sends its own keep_alive echo and
   // runs a 30-second timeout. We handle keep_alive manually in onBotCreated, so
   // we must set keepAlive: false to prevent the two handlers from conflicting —
-  // otherwise the internal timeout fires after ~30s and kicks the bot with
+  // otherwise the internal timeout fires and kicks the bot with
   // "client timed out after 30000 milliseconds".
   buildClientOptions(base) {
     return {
@@ -47,7 +47,6 @@ class FreshSmpProfile extends BaseProfile {
     // Required because keepAlive: false disables minecraft-protocol's built-in
     // handler. The server expects the client to echo keep_alive packets within
     // ~30 seconds or it disconnects with "Timed out".
-    // We write directly on bot._client (pre-any-proxy) to guarantee delivery.
     bot._client.on("keep_alive", (packet) => {
       try {
         bot._client.write("keep_alive", { keepAliveId: packet.keepAliveId });
@@ -71,30 +70,28 @@ class FreshSmpProfile extends BaseProfile {
   onLogin(bot, entry, botId, spawnBot, callbacks) {
     // Send client settings explicitly in play state.
     //
-    // FreshSMP (Paper-based) expects this shortly after entering play state.
-    // Without it, the server logs an internal error and kicks the client with
-    // "SERVER ERROR — An internal error occurred in your connection."
+    // FreshSMP (Paper 1.21.11) expects all fields of packet_common_settings.
+    // Missing any field causes the serializer to throw silently, meaning no
+    // settings packet is sent at all — which triggers the SERVER ERROR kick.
     //
-    // IMPORTANT: enableServerListing was removed from the 1.21.5+ protocol
-    // schema. Including it causes the serializer to throw silently, meaning
-    // no settings packet is ever sent — which is exactly what triggers the
-    // SERVER ERROR kick. Do NOT add it back.
+    // Required fields for 1.21.11 (verified against minecraft-data protocol.json):
+    //   locale, viewDistance, chatFlags, chatColors, skinParts, mainHand,
+    //   enableTextFiltering, enableServerListing, particleStatus
     //
-    // particleStatus (0=minimal, 1=decreased, 2=all) is required for 1.21.3+.
-    // The field is silently ignored by the serializer on older versions, so
-    // it is safe to include unconditionally.
+    // particleStatus mappings: 0=all, 1=decreased, 2=minimal
     setTimeout(() => {
       if (!bot || bot._client?.ended) return;
       try {
         bot._client.write("settings", {
-          locale:              "en_US",
-          viewDistance:        8,
-          chatFlags:           0,
-          chatColors:          true,
-          skinParts:           127,
-          mainHand:            1,
-          enableTextFiltering: false,
-          particleStatus:      2,
+          locale:               "en_US",
+          viewDistance:         8,
+          chatFlags:            0,
+          chatColors:           true,
+          skinParts:            127,
+          mainHand:             1,
+          enableTextFiltering:  false,
+          enableServerListing:  true,
+          particleStatus:       0,
         });
         console.log(`[FreshSmpProfile] ✅ [${entry.minecraftUser}] Client settings sent`);
       } catch (err) {

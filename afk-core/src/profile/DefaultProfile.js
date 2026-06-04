@@ -17,17 +17,24 @@ class DefaultProfile extends BaseProfile {
     setTimeout(() => {
       if (!bot || bot._client?.ended) return;
       try {
-        // IMPORTANT: enableServerListing was removed from the 1.21.5+ protocol
-        // schema. Do NOT add it back — it causes a silent serialization failure
-        // on modern servers, meaning no settings packet is sent at all.
+        // Required fields for 1.21.x (verified against minecraft-data protocol.json):
+        //   locale, viewDistance, chatFlags, chatColors, skinParts, mainHand,
+        //   enableTextFiltering, enableServerListing, particleStatus
+        //
+        // NOTE: enableServerListing is present and required in 1.21.3+ protocol schemas.
+        // Omitting it causes the serializer to throw silently and no settings packet
+        // is sent, which can trigger SERVER ERROR kicks on Paper-based servers.
+        // particleStatus mappings: 0=all, 1=decreased, 2=minimal
         bot._client.write("settings", {
-          locale:              "en_US",
-          viewDistance:        8,
-          chatFlags:           0,
-          chatColors:          true,
-          skinParts:           127,
-          mainHand:            1,
-          enableTextFiltering: false,
+          locale:               "en_US",
+          viewDistance:         8,
+          chatFlags:            0,
+          chatColors:           true,
+          skinParts:            127,
+          mainHand:             1,
+          enableTextFiltering:  false,
+          enableServerListing:  true,
+          particleStatus:       0,
         });
       } catch (err) {
         console.warn(`[botmanager] ⚠️ [${entry.minecraftUser}] Could not send client settings:`, err.message);
