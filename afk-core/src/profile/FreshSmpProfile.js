@@ -28,6 +28,16 @@ const FRESHSMP_GAMEMODES = {
   skywars:   "skywars",
 };
 
+// Routine outgoing packets that an AFK bot sends constantly — excluded from the
+// non-routine packet logger so the "Invalid sequence" culprit stands out.
+const ROUTINE_OUTGOING = new Set([
+  "pong", "keep_alive", "position", "position_look", "look", "flying",
+  "settings", "client_information", "teleport_confirm", "chat_command",
+  "chat_message", "chat", "arm_animation", "pong_play",
+  "configuration_acknowledged", "finish_configuration", "select_known_packs",
+  "chunk_batch_received", "chat_session_update", "custom_payload",
+]);
+
 /**
  * Build and write the correct client settings packet.
  *
@@ -163,6 +173,21 @@ class FreshSmpProfile extends BaseProfile {
           console.log(`[fresh-pkt] → CLIENT sent [${st}]: ${name}`, JSON.stringify(params).slice(0, 160));
         } catch {
           console.log(`[fresh-pkt] → CLIENT sent [${st}]: ${name} (non-serializable)`);
+        }
+      }
+
+      // ── Non-routine outgoing packet logger (ALWAYS ON) ──────────────────────
+      // "Invalid sequence" kicks come from a block-interaction packet with a bad
+      // seq field (use_item / block_dig / block_place / use_entity). Log every
+      // outgoing packet that ISN'T routine movement/keepalive so the culprit just
+      // before the kick is obvious. These are rare for an AFK bot, so it's quiet.
+      if (!ROUTINE_OUTGOING.has(name)) {
+        try {
+          console.log(
+            `[fresh-life] ${new Date().toISOString()} [${entry.minecraftUser}] → SENT ${name} ${JSON.stringify(params).slice(0, 160)}`
+          );
+        } catch {
+          console.log(`[fresh-life] ${new Date().toISOString()} [${entry.minecraftUser}] → SENT ${name}`);
         }
       }
       return _origWrite(name, params);
