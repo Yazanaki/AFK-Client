@@ -252,6 +252,19 @@ const BOT_FOOD_ITEMS = new Set([
   "chorus_fruit",
 ]);
 
+// How long to "hold" the item while eating before releasing, in ms.
+// Most foods take 32 ticks (~1.61s); honey bottle is the slowest at 40 ticks
+// (~2.0s), so we hold a bit past that. Faster foods (e.g. dried kelp, 16 ticks)
+// simply finish early and the extra hold is harmless (the item is already
+// consumed; we just release a moment later).
+const EAT_HOLD_MS = 2100;
+// Minimum gap between eat attempts — just above one full eat cycle so the
+// health event can't start a second eat before the first has been released.
+const EAT_COOLDOWN_MS = 1800;
+// Let the server acknowledge the held-slot change before we start the
+// interaction (mirrors the unused HungerHandler's SLOT_SWITCH_DELAY_MS).
+const EAT_EQUIP_SETTLE_MS = 150;
+
 // ============================================================
 // HELPERS
 // ============================================================
@@ -595,56 +608,33 @@ function startBot(
       );
     }
 
-    // ── use_item sequence tracking ────────────────────────────────────────────
-    // In 1.19+, Paper servers (e.g. DonutSMP) validate that use_item carries
-    // a monotonically-increasing sequence number per connection. We intercept
-    // every use_item write here — outermost layer, after all profile proxies —
-    // to guarantee the sequence is always correct.
-    //
-    // In 1.21.2+, use_item also requires yaw and pitch fields. We inject
-    // defaults from bot.entity here so the packet is never malformed even if
-    // the caller (mineflayer or our own code) omits them. Older servers that
-    // don't have these fields in their schema silently ignore them.
-    //
-    // Counter resets to 0 on each new bot instance (each spawnBot call),
-    // matching the server's per-connection sequence state.
-    //
-    // IMPORTANT: _preSeqWrite MUST be bound to bot._client so that
-    // minecraft-protocol's internal writes (e.g. setProtocol handshake) have
-    // the correct `this` context when they call through this proxy. Without
-    // the bind, `this.serializer` is undefined in strict mode and throws a
-    // TypeError on connect for any profile that does not itself replace
-    // bot._client.write (e.g. FreshSMP, Default, Hypixel).
-    let useItemSequence = 0;
-    {
-      const _preSeqWrite = bot._client.write.bind(bot._client);
-      bot._client.write = function useItemSequencePatch(name, params) {
-        if (name === "use_item" && params != null) {
-          params = {
-            ...params,
-            sequence: useItemSequence++,
-            // 1.21.2+ requires yaw & pitch; supply from bot entity if absent
-            yaw:   params.yaw   !== undefined ? params.yaw   : (bot.entity?.yaw   ?? 0),
-            pitch: params.pitch !== undefined ? params.pitch : (bot.entity?.pitch ?? 0),
-          };
-        }
-        return _preSeqWrite(name, params);
-      };
-    }
+    // ── use_item packet handling ──────────────────────────────────────────────
+    // NOTE: We deliberately do NOT wrap bot._client.write to patch use_item here
+    // anymore. The previous version hand-wrote a raw use_item and injected
+    // `sequence` + separate `yaw`/`pitch` fields — but the real 1.21.2+ schema is
+    // `{ hand, sequence, rotation: vec2f }` (a single rotation vector in NOTCHIAN
+    // DEGREES), and the block-interaction `sequence` is a single counter shared
+    // across use_item / block_dig / block_place that mineflayer owns. Injecting a
+    // separate counter and radian rotations produced a malformed/inconsistent
+    // packet — the "invalid sequence" kick. Eating now goes through mineflayer's
+    // bot.activateItem()/deactivateItem() (see tryEat below), which build the
+    // correct packet for the negotiated protocol, so no patching is needed.
 
     // ── Hunger ────────────────────────────────────────────────────────────────
-    // We write use_item directly instead of calling bot.consume() because:
-    //   1. bot.consume() may silently throw before the write (e.g. if
-    //      bot.heldItem is momentarily null after equip), meaning no packet
-    //      is ever sent and the bot slowly starves.
-    //   2. bot.consume()'s internal state machine can call activateItem() with
-    //      a stale or incorrectly formatted packet for 1.21.2+ protocol.
-    // Writing the packet directly lets our sequence/yaw/pitch proxy above
-    // handle everything cleanly. The server's inventory and health update
-    // packets keep mineflayer's state correct regardless.
+    // Eat the way a vanilla client does: equip the food, then use mineflayer's
+    // own activateItem()/deactivateItem() to start using the item, hold it for
+    // the food's use duration, and release. Going through mineflayer (rather
+    // than hand-writing a raw use_item) means the use_item + release packets are
+    // built to the exact negotiated-protocol schema — `{ hand, sequence,
+    // rotation }` for 1.21.2+, with the rotation in DEGREES and the `sequence`
+    // taken from mineflayer's coherent block-interaction counter. That faithful
+    // packet survives the 1.21.11→server translation and the transaction
+    // anti-cheat that was kicking us with "invalid sequence" the moment the old
+    // (malformed, radian-rotation, separate-counter) eat fired.
     async function tryEat() {
       if (isEating || Date.now() < eatCooldownUntil) return;
       if (!isCurrentBot()) return;
+      if (!bot.entity) return; // activateItem() reads bot.entity.yaw/pitch
       if (bot.food >= 18) return;
 
       const foodItem = bot.inventory.items().find(
@@ -655,14 +645,23 @@ function startBot(
       isEating = true;
       try {
         await bot.equip(foodItem, "hand");
-        // Write use_item directly — the proxy above injects sequence/yaw/pitch
-        bot._client.write("use_item", { hand: 0 });
-        eatCooldownUntil = Date.now() + 1500;
+        // Let the server ack the held-slot change before we start interacting.
+        await new Promise((r) => setTimeout(r, EAT_EQUIP_SETTLE_MS));
+        if (!isCurrentBot() || bot._client?.ended || !bot.entity) return;
+
+        // Start eating (use_item), hold for the use duration, then release.
+        bot.activateItem();
+        await new Promise((r) => setTimeout(r, EAT_HOLD_MS));
+        try { bot.deactivateItem(); } catch (_) {}
+
+        eatCooldownUntil = Date.now() + EAT_COOLDOWN_MS;
         console.log(
           `[botmanager] 🍖 ${minecraftUser} ate ${foodItem.name} (food: ${bot.food}/20)`
         );
       } catch (err) {
         console.warn(`[botmanager] ⚠️ Eat failed for ${minecraftUser}:`, err.message);
+        // Brief back-off so a transient failure doesn't hot-loop on health events.
+        eatCooldownUntil = Date.now() + 1500;
       } finally {
         isEating = false;
       }
