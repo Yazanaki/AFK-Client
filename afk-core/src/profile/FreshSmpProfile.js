@@ -176,18 +176,21 @@ class FreshSmpProfile extends BaseProfile {
         }
       }
 
-      // ── Non-routine outgoing packet logger (ALWAYS ON) ──────────────────────
-      // "Invalid sequence" kicks come from a block-interaction packet with a bad
-      // seq field (use_item / block_dig / block_place / use_entity). Log every
-      // outgoing packet that ISN'T routine movement/keepalive so the culprit just
-      // before the kick is obvious. These are rare for an AFK bot, so it's quiet.
-      if (!ROUTINE_OUTGOING.has(name)) {
-        try {
-          console.log(
-            `[fresh-life] ${new Date().toISOString()} [${entry.minecraftUser}] → SENT ${name} ${JSON.stringify(params).slice(0, 160)}`
-          );
-        } catch {
-          console.log(`[fresh-life] ${new Date().toISOString()} [${entry.minecraftUser}] → SENT ${name}`);
+      // ── Outgoing packet recorder ────────────────────────────────────────────
+      // Feed EVERY outgoing packet into the ring buffer (dumped on transfer/kick)
+      // so the packets just before an "Invalid sequence" are visible, including
+      // routine position/flying/teleport_confirm. Also log non-routine packets
+      // immediately so they stand out in real time.
+      {
+        let brief = "";
+        try { brief = JSON.stringify(params).slice(0, 120); } catch { brief = "(non-serializable)"; }
+        const rec = entry._recentOut;
+        if (rec) {
+          rec.push({ t: new Date().toISOString().slice(11, 23), name, brief });
+          if (rec.length > 25) rec.shift();
+        }
+        if (!ROUTINE_OUTGOING.has(name)) {
+          console.log(`[fresh-life] ${new Date().toISOString()} [${entry.minecraftUser}] → SENT ${name} ${brief}`);
         }
       }
       return _origWrite(name, params);
@@ -237,7 +240,24 @@ class FreshSmpProfile extends BaseProfile {
       return "";
     };
 
-    bot._client.on("state", (s) => _life(`CONNECTION STATE → ${s}`));
+    // Ring buffer of the last outgoing packets, dumped on each transfer/kick so
+    // we can see exactly what preceded an "Invalid sequence" — including the
+    // routine movement/teleport_confirm packets normally filtered out.
+    const _recentOut = [];
+    entry._recentOut = _recentOut;
+
+    bot._client.on("state", (s) => {
+      _life(`CONNECTION STATE → ${s}`);
+      // Entering configuration = we just got transferred/kicked. Dump what we
+      // sent in the moments before, with millisecond timing.
+      if (s === "configuration" && _recentOut.length) {
+        _life(`── last ${_recentOut.length} outgoing packets before transfer/kick ──`);
+        for (const e of _recentOut) {
+          console.log(`[fresh-life]    ${e.t}  → ${e.name} ${e.brief}`);
+        }
+        _recentOut.length = 0;
+      }
+    });
     bot._client.on("disconnect", (p) => {
       try { _life(`DISCONNECT (config phase) reason=${JSON.stringify(p?.reason)}`); }
       catch { _life(`DISCONNECT (config phase)`); }
