@@ -237,8 +237,16 @@ class FreshSmpProfile extends BaseProfile {
     // meaningful lines stand out.
     bot._client.on("system_chat", (p) => {
       try {
-        const txt = chatText(p?.content).replace(/§./g, "").trim();
-        if (txt) _life(`💬 CHAT: ${txt.slice(0, 220)}`);
+        const txt = chatText(p?.content).replace(/§./g, "").replace(/\s+/g, " ").trim();
+        if (!txt) return;
+        // For kick/relocation messages, dump the FULL flattened text plus the raw
+        // component so the reason after "kicked from Survival:" is never lost.
+        if (/kick|afk|bot|ban|suspicious|moved|removed|slot|priority|full/i.test(txt)) {
+          _life(`💬 CHAT[reason]: ${txt.slice(0, 500)}`);
+          try { _life(`   raw: ${JSON.stringify(p?.content).slice(0, 600)}`); } catch (_) {}
+        } else {
+          _life(`💬 CHAT: ${txt.slice(0, 220)}`);
+        }
       } catch (_) {}
     });
     bot.on("death", () => _life(`💀 DEATH — bot died (mineflayer will auto-respawn)`));
