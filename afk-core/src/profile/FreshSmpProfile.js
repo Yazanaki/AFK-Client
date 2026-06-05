@@ -191,6 +191,27 @@ class FreshSmpProfile extends BaseProfile {
     const _life = (msg) =>
       console.log(`[fresh-life] ${new Date().toISOString()} [${entry.minecraftUser}] ${msg}`);
 
+    // Flatten a prismarine-nbt chat component into readable plain text so we can
+    // see what the server is actually saying (instead of the raw NBT tree).
+    const chatText = (node) => {
+      if (node == null) return "";
+      if (typeof node === "string") return node;
+      if (Array.isArray(node)) return node.map(chatText).join("");
+      if (typeof node === "object") {
+        if (typeof node.type === "string" && "value" in node) {
+          if (node.type === "string") return String(node.value);
+          return chatText(node.value); // compound / list / etc.
+        }
+        let out = "";
+        if (node.translate !== undefined) out += chatText(node.translate);
+        if (node.text     !== undefined) out += chatText(node.text);
+        if (node.extra    !== undefined) out += chatText(node.extra);
+        if (node.with     !== undefined) out += " " + chatText(node.with);
+        return out;
+      }
+      return "";
+    };
+
     bot._client.on("state", (s) => _life(`CONNECTION STATE → ${s}`));
     bot._client.on("disconnect", (p) => {
       try { _life(`DISCONNECT (config phase) reason=${JSON.stringify(p?.reason)}`); }
@@ -212,10 +233,12 @@ class FreshSmpProfile extends BaseProfile {
 
     // Any chat the server sends — the reason for an AFK/anti-bot relocation is
     // usually announced here ("You were moved…", "AFK", "kicked", etc.).
+    // We extract readable text and skip empty/whitespace-only messages so the
+    // meaningful lines stand out.
     bot._client.on("system_chat", (p) => {
       try {
-        const txt = JSON.stringify(p?.content).slice(0, 200);
-        if (txt && txt !== "undefined" && txt !== '""') _life(`💬 SYSTEM_CHAT ${txt}`);
+        const txt = chatText(p?.content).replace(/§./g, "").trim();
+        if (txt) _life(`💬 CHAT: ${txt.slice(0, 220)}`);
       } catch (_) {}
     });
     bot.on("death", () => _life(`💀 DEATH — bot died (mineflayer will auto-respawn)`));
