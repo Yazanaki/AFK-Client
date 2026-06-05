@@ -179,6 +179,33 @@ class FreshSmpProfile extends BaseProfile {
       });
     }
 
+    // ── Lifecycle logger (ALWAYS ON) ─────────────────────────────────────────
+    // Prints one loud, wall-clock-timestamped line per lifecycle event so the
+    // in-game behaviour (player leaving/rejoining tab, avatar vanishing) can be
+    // correlated with what actually happens on the connection. These events are
+    // rare, so this is safe to leave on permanently — it is NOT gated by
+    // FRESHSMP_DEBUG. Watch for these lines the moment you see the bot flicker:
+    //   CONNECTION STATE → login/configuration/play  = real reconnect/transfer
+    //   💀 DEATH / ♻️ RESPAWN                          = killed & respawning in place
+    //   🔚 END / DISCONNECT                            = socket actually dropped
+    const _life = (msg) =>
+      console.log(`[fresh-life] ${new Date().toISOString()} [${entry.minecraftUser}] ${msg}`);
+
+    bot._client.on("state", (s) => _life(`CONNECTION STATE → ${s}`));
+    bot._client.on("disconnect", (p) => {
+      try { _life(`DISCONNECT (config phase) reason=${JSON.stringify(p?.reason)}`); }
+      catch { _life(`DISCONNECT (config phase)`); }
+    });
+    bot.on("death", () => _life(`💀 DEATH — bot died (mineflayer will auto-respawn)`));
+    bot.on("respawn", () => _life(`♻️ RESPAWN — respawn or dimension/world change`));
+    bot.on("end", (r) => _life(`🔚 END — socket closed, reason=${r}`));
+    // The server-side "you respawned / world changed" packet in PLAY state:
+    bot._client.on("respawn", () => _life(`← server sent RESPAWN packet (gamemode/world change)`));
+    bot._client.on("combat_death", (p) => {
+      try { _life(`☠️ COMBAT_DEATH message=${JSON.stringify(p?.message)}`); }
+      catch { _life(`☠️ COMBAT_DEATH`); }
+    });
+
     // ── Manual Minecraft keep-alive echo ─────────────────────────────────────
     // Required because keepAlive: false disables minecraft-protocol's built-in
     // handler. The server expects the client to echo keep_alive packets within
