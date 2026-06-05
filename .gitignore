@@ -1,0 +1,12 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# Runtime / generated artifacts
+tokens/
+version-cache.json
+*.log
+
+# Secrets / local env
+.env
+.env.local

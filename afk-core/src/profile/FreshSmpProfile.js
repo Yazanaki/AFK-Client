@@ -105,21 +105,18 @@ class FreshSmpProfile extends BaseProfile {
     // Canvas (and Paper) throw an internal exception when this field is missing,
     // producing a SERVER ERROR kick.
     //
-    // By intercepting ALL writes at the profile level (before botmanager's
-    // use_item patch is applied), we guarantee that every "settings" packet —
-    // whether sent by mineflayer internally, by onLogin, or by the transfer
-    // listener below — always carries the full set of required fields.
+    // By intercepting ALL writes at the profile level, we guarantee that every
+    // "settings" packet — whether sent by mineflayer internally, by onLogin, or
+    // by the transfer listener below — always carries the full set of required
+    // fields.
     //
     // Fields are merged with defaults so any value the caller explicitly sets
     // is preserved; only genuinely missing fields are filled in.
     //
-    // IMPORTANT: botmanager.js applies its own write proxy (use_item sequence)
-    // AFTER onBotCreated returns. The final write chain is therefore:
-    //   bot._client.write
-    //     → useItemSequencePatch  (botmanager, applied after)
-    //     → freshSmpSettingsPatch (this, applied now)
-    //     → original write
-    // Both patches operate on different packet names and do not interfere.
+    // NOTE: botmanager.js no longer wraps bot._client.write (use_item is now
+    // built correctly by mineflayer's activateItem()), so this freshSmpSettingsPatch
+    // is the only write proxy in the chain:
+    //   bot._client.write → freshSmpSettingsPatch (this) → original write
     const _origWrite = bot._client.write.bind(bot._client);
     bot._client.write = function freshSmpSettingsPatch(name, params) {
       // ── Drop movement packets during CONFIGURATION state ───────────────────
