@@ -196,6 +196,28 @@ class FreshSmpProfile extends BaseProfile {
       try { _life(`DISCONNECT (config phase) reason=${JSON.stringify(p?.reason)}`); }
       catch { _life(`DISCONNECT (config phase)`); }
     });
+
+    // Which backend server did we just land on? The play "login" packet carries
+    // the dimension/world name — if the bot is bouncing survival↔lobby this will
+    // change every transfer and pinpoint where it's being sent.
+    bot._client.on("login", (packet) => {
+      const world = packet?.worldName ?? packet?.dimension ?? "unknown";
+      _life(`▶ JOINED world="${world}" (entityId=${packet?.entityId}, gamemode=${packet?.gameMode ?? packet?.previousGameMode})`);
+    });
+
+    // Velocity clientbound transfer packet — explicit "go to this server" command.
+    bot._client.on("transfer", (p) => {
+      _life(`➡️ TRANSFER packet → ${p?.host}:${p?.port}`);
+    });
+
+    // Any chat the server sends — the reason for an AFK/anti-bot relocation is
+    // usually announced here ("You were moved…", "AFK", "kicked", etc.).
+    bot._client.on("system_chat", (p) => {
+      try {
+        const txt = JSON.stringify(p?.content).slice(0, 200);
+        if (txt && txt !== "undefined" && txt !== '""') _life(`💬 SYSTEM_CHAT ${txt}`);
+      } catch (_) {}
+    });
     bot.on("death", () => _life(`💀 DEATH — bot died (mineflayer will auto-respawn)`));
     bot.on("respawn", () => _life(`♻️ RESPAWN — respawn or dimension/world change`));
     bot.on("end", (r) => _life(`🔚 END — socket closed, reason=${r}`));
