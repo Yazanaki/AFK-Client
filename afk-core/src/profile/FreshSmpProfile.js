@@ -319,8 +319,23 @@ class FreshSmpProfile extends BaseProfile {
       }
     });
 
+    // ── ping/pong: do NOT manually respond ───────────────────────────────────
+    // ROOT CAUSE of the "Invalid sequence" kick + flicker loop: minecraft-protocol
+    // already auto-responds to the play-state `ping` transaction packet with a
+    // `pong`. Our manual pong here was a DUPLICATE — the survival backend's
+    // anti-cheat sends rapid ping probes and expects exactly one pong per ping;
+    // receiving two pongs (mineflayer's + ours) registered as an out-of-order /
+    // duplicate id and, after ~19s of accumulated violations, kicked the bot
+    // with "Invalid sequence". Velocity then dropped it to lobby and the queue
+    // re-sent it, producing the endless ~20s transfer/flicker cycle.
+    //
+    // We now defer entirely to minecraft-protocol's built-in pong. (The first
+    // few pings are logged so we can confirm mineflayer is still answering them.)
+    let _pingSeen = 0;
     bot._client.on("ping", (packet) => {
-      try { _origWrite("pong", { id: packet.id }); } catch (_) {}
+      if (++_pingSeen <= 3) {
+        _life(`(ping #${_pingSeen} id=${packet.id}) — pong handled by minecraft-protocol, not manually`);
+      }
     });
 
     // ── Cookie request (Velocity 1.20.5+) ────────────────────────────────────
