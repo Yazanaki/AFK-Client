@@ -338,6 +338,38 @@ class FreshSmpProfile extends BaseProfile {
       }
     });
 
+    // ── Per-tick movement keepalive (anti-cheat compliance) ──────────────────
+    // ROOT CAUSE of the "Invalid sequence" kick. FreshSMP's survival backend runs
+    // a transaction-based anti-cheat: it sends a `ping` every server tick (~20/s)
+    // and correlates the client's responses with per-tick movement. A real
+    // vanilla client sends a movement packet (`flying {onGround}`) EVERY tick even
+    // while standing perfectly still. mineflayer optimizes this away — when idle
+    // it sends `position` only ~once per second. The anti-cheat sees 20 ping
+    // transactions per second but only ~1 movement packet, the per-tick sequence
+    // breaks, and after ~19s it kicks with "Invalid sequence" (→ lobby → re-queue
+    // → the endless ~20s flicker loop).
+    //
+    // We replicate vanilla idle behaviour by sending `flying` every 50ms while in
+    // PLAY state. Uses _origWrite so it isn't dropped by the config-state movement
+    // filter and doesn't spam the ring buffer. Self-clears when the socket ends.
+    let _tickMoveTimer = setInterval(() => {
+      if (!bot || !bot._client || bot._client.ended) {
+        clearInterval(_tickMoveTimer);
+        _tickMoveTimer = null;
+        return;
+      }
+      if (bot._client.state !== "play") return;
+      try {
+        const og = (bot.entity && typeof bot.entity.onGround === "boolean")
+          ? bot.entity.onGround : true;
+        _origWrite("flying", { onGround: og });
+      } catch (_) {}
+    }, 50);
+    entry._tickMoveTimer = _tickMoveTimer;
+    bot.on("end", () => {
+      if (_tickMoveTimer) { clearInterval(_tickMoveTimer); _tickMoveTimer = null; }
+    });
+
     // ── Cookie request (Velocity 1.20.5+) ────────────────────────────────────
     // Velocity proxies can send a cookie_request packet during login. The client
     // must respond with cookie_response (even if empty) or the proxy drops the
