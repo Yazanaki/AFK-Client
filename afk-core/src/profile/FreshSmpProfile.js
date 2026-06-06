@@ -349,6 +349,7 @@ class FreshSmpProfile extends BaseProfile {
     // We replicate vanilla idle behaviour by sending `flying` every 50ms while in
     // PLAY state. Uses _origWrite so it isn't dropped by the config-state movement
     // filter and doesn't spam the ring buffer. Self-clears when the socket ends.
+    let _tickMoveWarned = false;
     let _tickMoveTimer = setInterval(() => {
       if (!bot || !bot._client || bot._client.ended) {
         clearInterval(_tickMoveTimer);
@@ -359,8 +360,22 @@ class FreshSmpProfile extends BaseProfile {
       try {
         const og = (bot.entity && typeof bot.entity.onGround === "boolean")
           ? bot.entity.onGround : true;
-        _origWrite("flying", { onGround: og });
-      } catch (_) {}
+        // 1.21.2+ movement packets carry a MovementFlags bitfield, NOT a bare
+        // `onGround` boolean. The old { onGround } shape threw "SizeOf error for
+        // undefined" on EVERY tick — silently swallowed by the catch below — so
+        // this per-tick keepalive never actually sent a packet, and FreshSMP's
+        // transaction anti-cheat kept kicking us with "Invalid sequence". Send
+        // the correct { flags } shape (matches mineflayer's own physics writes).
+        _origWrite("flying", { flags: { onGround: og, hasHorizontalCollision: false } });
+      } catch (err) {
+        if (!_tickMoveWarned) {
+          _tickMoveWarned = true;
+          console.warn(
+            `[FreshSmpProfile] ⚠️ [${entry.minecraftUser}] per-tick flying failed:`,
+            err.message
+          );
+        }
+      }
     }, 50);
     entry._tickMoveTimer = _tickMoveTimer;
     bot.on("end", () => {
