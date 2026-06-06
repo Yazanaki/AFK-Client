@@ -617,20 +617,21 @@ function startBot(
     // across use_item / block_dig / block_place that mineflayer owns. Injecting a
     // separate counter and radian rotations produced a malformed/inconsistent
     // packet — the "invalid sequence" kick. Eating now goes through mineflayer's
-    // bot.activateItem()/deactivateItem() (see tryEat below), which build the
-    // correct packet for the negotiated protocol, so no patching is needed.
+    // bot.activateItem() (see tryEat below), which builds the correct packet for
+    // the negotiated protocol, so no patching is needed.
 
     // ── Hunger ────────────────────────────────────────────────────────────────
-    // Eat the way a vanilla client does: equip the food, then use mineflayer's
-    // own activateItem()/deactivateItem() to start using the item, hold it for
-    // the food's use duration, and release. Going through mineflayer (rather
-    // than hand-writing a raw use_item) means the use_item + release packets are
-    // built to the exact negotiated-protocol schema — `{ hand, sequence,
-    // rotation }` for 1.21.2+, with the rotation in DEGREES and the `sequence`
-    // taken from mineflayer's coherent block-interaction counter. That faithful
-    // packet survives the 1.21.11→server translation and the transaction
-    // anti-cheat that was kicking us with "invalid sequence" the moment the old
-    // (malformed, radian-rotation, separate-counter) eat fired.
+    // Eat the way mineflayer's own bot.consume() does: equip the food, then send
+    // a SINGLE use_item via bot.activateItem(). mineflayer builds it to the exact
+    // negotiated-protocol schema — `{ hand, sequence, rotation }` for 1.21.2+,
+    // with the rotation in DEGREES and `sequence` from mineflayer's coherent
+    // block-interaction counter. We deliberately do NOT send a release
+    // (block_dig status=5): real eating completes server-side after the food's
+    // use duration, and bot.consume() never sends one either. The earlier
+    // "vanilla-like" release call emitted a block_dig with sequence=0 right after
+    // a use_item with sequence=N — a backward jump in the shared interaction
+    // sequence that the transaction anti-cheat (and the 1.21.11→26.x translation)
+    // rejects as "invalid sequence".
     async function tryEat() {
       if (isEating || Date.now() < eatCooldownUntil) return;
       if (!isCurrentBot()) return;
@@ -649,10 +650,13 @@ function startBot(
         await new Promise((r) => setTimeout(r, EAT_EQUIP_SETTLE_MS));
         if (!isCurrentBot() || bot._client?.ended || !bot.entity) return;
 
-        // Start eating (use_item), hold for the use duration, then release.
+        // Single use_item; let the server finish the eat after the use duration.
+        // No release packet (see note above) — that backward-sequence block_dig
+        // was the residual "invalid sequence" trigger.
         bot.activateItem();
         await new Promise((r) => setTimeout(r, EAT_HOLD_MS));
-        try { bot.deactivateItem(); } catch (_) {}
+        // Clear mineflayer's local "using item" flag WITHOUT sending a packet.
+        bot.usingHeldItem = false;
 
         eatCooldownUntil = Date.now() + EAT_COOLDOWN_MS;
         console.log(
