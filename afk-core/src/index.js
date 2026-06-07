@@ -16,7 +16,7 @@
 
 const { DefaultProfile }  = require("./profile/DefaultProfile");
 const { DonutSmpProfile } = require("./profile/donutsmp");
-const { FreshSmpProfile } = require("./profile/FreshSmpProfile");
+const { FreshSmpProfile } = require("./profile/freshsmp");
 const { HypixelProfile }  = require("./profile/HypixelProfile");
 
 // ─── Profile singletons ────────────────────────────────────────────────────────
