@@ -19,6 +19,7 @@ const { installPerTickMovement } = require("./movement");
 const { installTransferHandler } = require("./transfer");
 const antiAfk = require("./antiAfk");
 const gamemode = require("./gamemode");
+const { attachHunger } = require("./hunger");
 
 const FRESHSMP_VERSION = "1.21.11";
 
@@ -45,6 +46,7 @@ class FreshSmpProfile extends BaseProfile {
     installKeepAlive(bot, entry, origWrite);
     installPerTickMovement(bot, entry, origWrite);
     installTransferHandler(bot, entry);
+    attachHunger(bot, entry);
 
     // Start anti-AFK after login (valid entity yaw/pitch; not during the
     // pre-login security screen).

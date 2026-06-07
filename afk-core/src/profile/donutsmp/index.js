@@ -13,6 +13,7 @@ const { installMovementSuppression } = require("./movement");
 const { installKeepAlive } = require("./keepAlive");
 const antiAfk = require("./antiAfk");
 const verification = require("./verification");
+const { attachHunger } = require("./hunger");
 
 const DONUTSMP_VERSION = "1.21.11";
 
@@ -31,6 +32,7 @@ class DonutSmpProfile extends BaseProfile {
     entry._donutOrigWrite = origWrite;
 
     installKeepAlive(bot, origWrite);
+    attachHunger(bot, entry);
 
     // Wait for login so we have a valid entity yaw/pitch and aren't sending
     // look packets during the pre-login security screen.
@@ -39,7 +41,7 @@ class DonutSmpProfile extends BaseProfile {
     });
 
     console.log(
-      `[DonutSmpProfile] ✅ Handlers attached — movement block + manual keep-alive + ping/pong + anti-AFK + TCP keepalive active`
+      `[DonutSmpProfile] ✅ Handlers attached — movement block + manual keep-alive + ping/pong + anti-AFK + TCP keepalive + hunger active`
     );
   }
 

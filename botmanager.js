@@ -233,37 +233,12 @@ loadVersionCache();
 // ============================================================
 // HUNGER MANAGEMENT
 //
-// Safe food items the bot will auto-eat.
-// Dangerous items (pufferfish, spider_eye, rotten_flesh,
-// poisonous_potato) are intentionally excluded.
+// Auto-eat now lives per-profile (survival servers only):
+//   afk-core/src/profile/donutsmp/hunger.js
+//   afk-core/src/profile/freshsmp/hunger.js
+// Each is attached from its profile's onBotCreated(). botmanager no longer
+// manages eating globally.
 // ============================================================
-const BOT_FOOD_ITEMS = new Set([
-  "cooked_beef", "cooked_porkchop", "cooked_chicken", "cooked_mutton",
-  "cooked_rabbit", "cooked_cod", "cooked_salmon",
-  "beef", "porkchop", "chicken", "mutton", "rabbit", "cod", "salmon",
-  "bread", "cookie", "pumpkin_pie",
-  "apple", "golden_apple", "enchanted_golden_apple",
-  "carrot", "golden_carrot", "melon_slice",
-  "baked_potato", "potato", "beetroot",
-  "sweet_berries", "glow_berries",
-  "tropical_fish", "dried_kelp",
-  "honey_bottle",
-  "mushroom_stew", "beetroot_soup", "rabbit_stew",
-  "chorus_fruit",
-]);
-
-// How long to "hold" the item while eating before releasing, in ms.
-// Most foods take 32 ticks (~1.61s); honey bottle is the slowest at 40 ticks
-// (~2.0s), so we hold a bit past that. Faster foods (e.g. dried kelp, 16 ticks)
-// simply finish early and the extra hold is harmless (the item is already
-// consumed; we just release a moment later).
-const EAT_HOLD_MS = 2100;
-// Minimum gap between eat attempts — just above one full eat cycle so the
-// health event can't start a second eat before the first has been released.
-const EAT_COOLDOWN_MS = 1800;
-// Let the server acknowledge the held-slot change before we start the
-// interaction (mirrors the unused HungerHandler's SLOT_SWITCH_DELAY_MS).
-const EAT_EQUIP_SETTLE_MS = 150;
 
 // ============================================================
 // HELPERS
@@ -519,10 +494,6 @@ function startBot(
 
   activeBots.set(botId, entry);
 
-  // Hunger state persists across reconnects for this bot session
-  let isEating = false;
-  let eatCooldownUntil = 0;
-
   const initialSpawnTimeoutMs = profile.id === "donutsmp" ? 90000 : 30000;
 
   entry.spawnTimeoutId = setTimeout(() => {
@@ -608,73 +579,10 @@ function startBot(
       );
     }
 
-    // ── use_item packet handling ──────────────────────────────────────────────
-    // NOTE: We deliberately do NOT wrap bot._client.write to patch use_item here
-    // anymore. The previous version hand-wrote a raw use_item and injected
-    // `sequence` + separate `yaw`/`pitch` fields — but the real 1.21.2+ schema is
-    // `{ hand, sequence, rotation: vec2f }` (a single rotation vector in NOTCHIAN
-    // DEGREES), and the block-interaction `sequence` is a single counter shared
-    // across use_item / block_dig / block_place that mineflayer owns. Injecting a
-    // separate counter and radian rotations produced a malformed/inconsistent
-    // packet — the "invalid sequence" kick. Eating now goes through mineflayer's
-    // bot.activateItem() (see tryEat below), which builds the correct packet for
-    // the negotiated protocol, so no patching is needed.
-
     // ── Hunger ────────────────────────────────────────────────────────────────
-    // Eat the way mineflayer's own bot.consume() does: equip the food, then send
-    // a SINGLE use_item via bot.activateItem(). mineflayer builds it to the exact
-    // negotiated-protocol schema — `{ hand, sequence, rotation }` for 1.21.2+,
-    // with the rotation in DEGREES and `sequence` from mineflayer's coherent
-    // block-interaction counter. We deliberately do NOT send a release
-    // (block_dig status=5): real eating completes server-side after the food's
-    // use duration, and bot.consume() never sends one either. The earlier
-    // "vanilla-like" release call emitted a block_dig with sequence=0 right after
-    // a use_item with sequence=N — a backward jump in the shared interaction
-    // sequence that the transaction anti-cheat (and the 1.21.11→26.x translation)
-    // rejects as "invalid sequence".
-    async function tryEat() {
-      if (isEating || Date.now() < eatCooldownUntil) return;
-      if (!isCurrentBot()) return;
-      if (!bot.entity) return; // activateItem() reads bot.entity.yaw/pitch
-      if (bot.food >= 18) return;
-
-      const foodItem = bot.inventory.items().find(
-        (item) => item && BOT_FOOD_ITEMS.has(item.name)
-      );
-      if (!foodItem) return;
-
-      isEating = true;
-      try {
-        await bot.equip(foodItem, "hand");
-        // Let the server ack the held-slot change before we start interacting.
-        await new Promise((r) => setTimeout(r, EAT_EQUIP_SETTLE_MS));
-        if (!isCurrentBot() || bot._client?.ended || !bot.entity) return;
-
-        // Single use_item; let the server finish the eat after the use duration.
-        // No release packet (see note above) — that backward-sequence block_dig
-        // was the residual "invalid sequence" trigger.
-        bot.activateItem();
-        await new Promise((r) => setTimeout(r, EAT_HOLD_MS));
-        // Clear mineflayer's local "using item" flag WITHOUT sending a packet.
-        bot.usingHeldItem = false;
-
-        eatCooldownUntil = Date.now() + EAT_COOLDOWN_MS;
-        console.log(
-          `[botmanager] 🍖 ${minecraftUser} ate ${foodItem.name} (food: ${bot.food}/20)`
-        );
-      } catch (err) {
-        console.warn(`[botmanager] ⚠️ Eat failed for ${minecraftUser}:`, err.message);
-        // Brief back-off so a transient failure doesn't hot-loop on health events.
-        eatCooldownUntil = Date.now() + 1500;
-      } finally {
-        isEating = false;
-      }
-    }
-
-    bot.on("health", () => {
-      if (!isCurrentBot()) return;
-      if (bot.food < 18) tryEat().catch(() => {});
-    });
+    // Auto-eat is attached per-profile now (see donutsmp/hunger.js and
+    // freshsmp/hunger.js, wired from each profile's onBotCreated). botmanager no
+    // longer manages eating, so there is nothing to set up here.
 
     // ── Login ─────────────────────────────────────────────────────────────────
     bot.once("login", () => {
