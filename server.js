@@ -205,7 +205,9 @@ app.post("/start", (req, res) => {
   );
 
   if (!result.success) {
-    const statusCode = result.reason === "already_running" ? 409 : 500;
+    // Capacity / conflict reasons are 409, genuine failures are 500.
+    const capacityReasons = ["already_running", "donutsmp_limit_reached", "max_bots_reached"];
+    const statusCode = capacityReasons.includes(result.reason) ? 409 : 500;
     return res.status(statusCode).json({ ok: false, ...result });
   }
 

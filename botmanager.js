@@ -172,6 +172,9 @@ const AUTH_ERROR_DEDUP_TTL_MS = 10 * 60 * 1000;
 const AUTO_RECONNECT = process.env.AUTO_RECONNECT === "true";
 const RECONNECT_DELAY_MS = parseInt(process.env.RECONNECT_DELAY_MS || "5000", 10);
 const MAX_BOTS = parseInt(process.env.MAX_BOTS || "0", 10); // 0 = unlimited
+// Cap on simultaneous bots connected to DonutSMP specifically — running many
+// alts on DonutSMP at once risks an alt-detection ban. 0 = unlimited.
+const MAX_DONUTSMP_BOTS = parseInt(process.env.MAX_DONUTSMP_BOTS || "5", 10);
 
 // ============================================================
 // VERSION CACHE — remembers which version worked per host
@@ -442,6 +445,21 @@ function startBot(
   // ── Version resolution ──────────────────────────────────────────────────────
   const profile = getProfileForHost(hostLower);
   const profileVersion = profile.version;
+
+  // ── DonutSMP concurrency cap ────────────────────────────────────────────────
+  // Reject if DonutSMP already has the maximum number of bots connected. This
+  // bot isn't in activeBots yet, so the count is of OTHER active DonutSMP bots.
+  if (profile.id === "donutsmp" && MAX_DONUTSMP_BOTS > 0) {
+    let donutCount = 0;
+    for (const e of activeBots.values()) {
+      if (e.profile && e.profile.id === "donutsmp") donutCount++;
+    }
+    if (donutCount >= MAX_DONUTSMP_BOTS) {
+      console.warn(`[botmanager] ⚠️ DonutSMP bot limit reached (${donutCount}/${MAX_DONUTSMP_BOTS})`);
+      console.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n");
+      return { success: false, reason: "donutsmp_limit_reached", max: MAX_DONUTSMP_BOTS };
+    }
+  }
 
   const requestedVersion = String(version || "auto").trim().toLowerCase();
 
