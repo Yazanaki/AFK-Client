@@ -1,30 +1,33 @@
 // afk-core/src/profile/donutsmp/hunger.js
 "use strict";
 
-// DonutSMP auto-eat. Self-contained copy (see also freshsmp/hunger.js).
+// DonutSMP auto-eat.
 //
-// Eats the way mineflayer's own bot.consume() does: a SINGLE use_item via
-// bot.activateItem() — mineflayer builds the correct { hand, sequence, rotation }
-// packet for the negotiated protocol, with the sequence taken from its coherent,
-// monotonically-increasing block-interaction counter (inventory.js).
+// THE REAL CAUSE OF THE "invalid sequence" KICK ON DONUTSMP
+// --------------------------------------------------------
+// It was never the use_item packet's shape (that was fixed long ago — we go
+// through bot.activateItem(), which builds the correct { hand, sequence,
+// rotation } and advances mineflayer's monotonic block-interaction counter, and
+// we never send a backward-sequence release). The kick still fired because of
+// HOW DonutSMP freezes movement.
 //
-// Two things are deliberately NOT done, because both are known causes of the
-// "invalid sequence" kick on DonutSMP (verified against minecraft-data 1.21.11 /
-// protocol 774 in test/use_item_eat.test.js):
-//   1. We do NOT hand-write the use_item packet ourselves. The 1.21.2+ schema is
-//      { hand, sequence, rotation: vec2f } — a raw write that omits `sequence` or
-//      `rotation`, or uses the old separate yaw/pitch fields, fails to serialize
-//      or sends a sequence the server rejects. Only bot.activateItem() builds it
-//      correctly and keeps the shared sequence counter coherent.
-//   2. We do NOT send a release (deactivateItem → block_dig status=5). Real
-//      eating completes server-side after the food's use duration; the release
-//      carries sequence=0, which is *lower* than the use_item we just sent, so
-//      the server sees the sequence go backward and kicks for "invalid sequence".
-//      mineflayer already clears bot.usingHeldItem on its own (entity_status 9 /
-//      heldItemChanged / set_cooldown) with no packet, so no release is needed.
+// DonutSMP's anti-cheat runs a per-tick ping/transaction stream (~20/s — see
+// keepAlive.js). A real client answers each tick with a movement packet, so the
+// server can place every interaction in a transaction window. DonutSMP's
+// movement.js deliberately BLOCKS all `position`/`flying` to look perfectly
+// still (anti-detection). While the bot is just standing there that's fine —
+// there's no sequenced interaction to validate. But the instant we eat, the
+// use_item carries a `sequence` the anti-cheat tries to slot into its per-tick
+// transaction stream — and there is no movement rhythm to slot it against, so it
+// rejects the interaction as "invalid sequence". This is exactly the failure
+// FreshSMP hit (fixed there with per-tick `flying`); the difference is FreshSMP
+// sends that rhythm always, DonutSMP stays frozen.
 //
-// use_item is NOT in the movement-suppression blocklist (only position/flying
-// are), so bot.activateItem() flows straight through to the real client write.
+// FIX: keep the vanilla idle-movement rhythm alive ONLY for the duration of an
+// eat — send `flying` (~20/s, no position change) via origWrite so it bypasses
+// the movement-suppression proxy — then stop and re-freeze. The use_item now
+// lands inside a valid transaction window. Outside of eating the bot stays
+// frozen, preserving the anti-detection posture.
 
 // Safe food items to auto-eat. Dangerous items (pufferfish, spider_eye,
 // rotten_flesh, poisonous_potato) are intentionally excluded.
@@ -47,12 +50,32 @@ const EAT_THRESHOLD = 18;          // start eating below this (1 full bar lost)
 const EAT_HOLD_MS = 2100;          // wait past the slowest food (honey, ~2.0s)
 const EAT_COOLDOWN_MS = 1800;      // min gap between eats (> one full eat cycle)
 const EAT_EQUIP_SETTLE_MS = 150;   // let the server ack the held-slot change
+const MOVE_TICK_MS = 50;           // vanilla per-tick movement cadence (~20/s)
 
 function attachHunger(bot, entry) {
   let isEating = false;
   let eatCooldownUntil = 0;
 
   const isCurrent = () => entry.bot === bot && !bot._client?.ended;
+
+  // Per-tick `flying` rhythm, on only while we eat. Uses origWrite so it isn't
+  // dropped by the movement-suppression proxy (which blocks `flying`).
+  function startMovementRhythm() {
+    const origWrite = entry._donutOrigWrite;
+    if (!origWrite) return null; // can't bypass the proxy → no rhythm available
+    const timer = setInterval(() => {
+      if (!isCurrent() || bot._client?.state !== "play") return;
+      try {
+        const onGround = (bot.entity && typeof bot.entity.onGround === "boolean")
+          ? bot.entity.onGround : true;
+        origWrite("flying", { flags: { onGround, hasHorizontalCollision: false } });
+      } catch {
+        /* session closing — ignore */
+      }
+    }, MOVE_TICK_MS);
+    if (timer.unref) timer.unref();
+    return timer;
+  }
 
   async function tryEat() {
     if (isEating || Date.now() < eatCooldownUntil) return;
@@ -66,14 +89,20 @@ function attachHunger(bot, entry) {
     if (!foodItem) return;
 
     isEating = true;
+    let rhythm = null;
     try {
+      // Start the movement rhythm BEFORE we touch the hotbar / use the item so
+      // the whole interaction (equip + use_item) sits inside a valid transaction
+      // window, then give the server a few ticks of rhythm to settle.
+      rhythm = startMovementRhythm();
+
       await bot.equip(foodItem, "hand");
-      // Let the server ack the held-slot change before we start interacting.
       await new Promise((r) => setTimeout(r, EAT_EQUIP_SETTLE_MS));
       if (!isCurrent() || !bot.entity) return;
 
-      // Single use_item; let the server finish the eat after the use duration.
-      // mineflayer builds { hand, sequence, rotation } and bumps the sequence.
+      // Single use_item; mineflayer builds { hand, sequence, rotation } and bumps
+      // the sequence. Let the server finish the eat after the use duration — no
+      // release (a block_dig sequence:0 would jump the sequence backward).
       bot.activateItem();
       await new Promise((r) => setTimeout(r, EAT_HOLD_MS));
       bot.usingHeldItem = false; // clear local "using" flag without a packet
@@ -84,6 +113,7 @@ function attachHunger(bot, entry) {
       console.warn(`[donutsmp/hunger] ⚠️ Eat failed for ${entry.minecraftUser}:`, err.message);
       eatCooldownUntil = Date.now() + 1500;
     } finally {
+      if (rhythm) clearInterval(rhythm); // re-freeze: stop sending movement
       isEating = false;
     }
   }
