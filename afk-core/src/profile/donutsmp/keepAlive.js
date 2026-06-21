@@ -16,7 +16,47 @@ const { KEEP_ALIVE_DEBUG } = require("./movement");
 // OS-level idle probe delay. Detects a silently-dropped TCP connection.
 const TCP_KEEPALIVE_INITIAL_DELAY_MS = 60 * 1000;
 
+// If the server goes silent (no keep_alive AND no ping) for this long, treat the
+// connection as dead and force a disconnect. We run mineflayer with
+// keepAlive:false, so nothing else detects a silent server-side kick — without
+// this the bot would stay stuck reporting "online" forever. 0 disables it.
+const KEEPALIVE_LIVENESS_TIMEOUT_MS = parseInt(
+  process.env.DONUTSMP_KEEPALIVE_TIMEOUT_MS || "60000",
+  10
+);
+
 function installKeepAlive(bot, origWrite) {
+  // ── Liveness watchdog ──────────────────────────────────────────────────────
+  // Track the last keep_alive / ping from the server. While the bot is genuinely
+  // in-world these arrive constantly (ping is ~per-tick), so if they stop for
+  // KEEPALIVE_LIVENESS_TIMEOUT_MS the session is dead even though no
+  // kicked/end/error event fired. Forcing bot.end() routes through botmanager's
+  // end handler, which flips the bot off "online" and reconnects.
+  let lastInboundAt = Date.now();
+  let livenessInterval = null;
+  const markAlive = () => { lastInboundAt = Date.now(); };
+  const stopLiveness = () => {
+    if (livenessInterval) { clearInterval(livenessInterval); livenessInterval = null; }
+  };
+  const startLiveness = () => {
+    lastInboundAt = Date.now();
+    if (KEEPALIVE_LIVENESS_TIMEOUT_MS <= 0 || livenessInterval) return;
+    const checkEvery = Math.max(5000, Math.floor(KEEPALIVE_LIVENESS_TIMEOUT_MS / 4));
+    livenessInterval = setInterval(() => {
+      if (Date.now() - lastInboundAt <= KEEPALIVE_LIVENESS_TIMEOUT_MS) return;
+      console.warn(
+        `[DonutSmpProfile] ⚠️ No keep_alive/ping for ${KEEPALIVE_LIVENESS_TIMEOUT_MS / 1000}s — ` +
+        `connection looks dead; forcing disconnect so it stops reporting "online".`
+      );
+      stopLiveness();
+      try { bot.end("keepalive_timeout"); }
+      catch { try { bot._client.end("keepalive_timeout"); } catch {} }
+    }, checkEvery);
+    if (livenessInterval.unref) livenessInterval.unref();
+  };
+  bot.once("login", startLiveness);
+  bot.once("end", stopLiveness);
+
   bot._client.once("connect", () => {
     try {
       const socket = bot._client.socket;
@@ -32,6 +72,7 @@ function installKeepAlive(bot, origWrite) {
   });
 
   bot._client.on("keep_alive", (packet) => {
+    markAlive();
     try {
       origWrite("keep_alive", { keepAliveId: packet.keepAliveId });
       if (KEEP_ALIVE_DEBUG) {
@@ -45,9 +86,12 @@ function installKeepAlive(bot, origWrite) {
   });
 
   bot._client.on("ping", (packet) => {
+    markAlive();
     try {
       origWrite("pong", { id: packet.id });
-      console.log(`[donut-pkt] 🏓 ping id=${packet.id} → pong sent`);
+      if (KEEP_ALIVE_DEBUG) {
+        console.log(`[donut-pkt] 🏓 ping id=${packet.id} → pong sent`);
+      }
     } catch (err) {
       console.warn(`[DonutSmpProfile] ⚠️ Could not send pong:`, err.message);
     }
