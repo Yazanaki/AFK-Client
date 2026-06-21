@@ -161,6 +161,27 @@ function getAndClearRecentlyEnded() {
 }
 
 // ============================================================
+// KICK NOTIFY COOLDOWN
+// A bot that keeps getting kicked while AUTO_RECONNECT is on would otherwise
+// queue a "your bot was kicked" DM on every reconnect. Throttle to one kick
+// notification per bot per cooldown window. Genuine, infrequent kicks still
+// notify; a tight kick→reconnect loop notifies once, not every few seconds.
+// ============================================================
+const lastKickNotifyAt = new Map();
+const KICK_NOTIFY_COOLDOWN_MS = parseInt(
+  process.env.KICK_NOTIFY_COOLDOWN_MS || "300000", // 5 min
+  10
+);
+
+function notifyKickThrottled(entry) {
+  const now = Date.now();
+  const last = lastKickNotifyAt.get(entry.botId) || 0;
+  if (now - last < KICK_NOTIFY_COOLDOWN_MS) return;
+  lastKickNotifyAt.set(entry.botId, now);
+  recordEndedBot(entry, "kicked");
+}
+
+// ============================================================
 // AUTH ERROR DEDUP GUARD
 // ============================================================
 const handledAuthErrors = new Set();
@@ -688,6 +709,10 @@ function startBot(
       e.spawnError = `Kicked: ${reasonText}`;
 
       if (AUTO_RECONNECT) {
+        // Tell the user their bot was kicked (with the real reason) even though
+        // we're about to reconnect — otherwise a kick that auto-recovers is
+        // completely invisible to them. Throttled so a kick loop can't spam DMs.
+        notifyKickThrottled(e);
         console.log(
           `[botmanager] 🔄 Reconnecting ${minecraftUser} in ${RECONNECT_DELAY_MS}ms...`
         );

@@ -46,7 +46,14 @@ class DonutSmpProfile extends BaseProfile {
   }
 
   onLogin(bot, entry, botId, spawnBot, callbacks) {}
-  onSpawn(bot, entry, botId) {}
+
+  onSpawn(bot, entry, botId) {
+    // A successful spawn means we cleared any verification gate. Reset the
+    // per-episode verification retry counter so a later genuine verification
+    // (e.g. a new IP) starts fresh — and so ordinary, unrelated kicks during a
+    // healthy session never accumulate toward the "give up" limit.
+    entry.donutSmpVerificationRetries = 0;
+  }
 
   onKick(bot, entry, botId, reasonText, spawnBot, autoMode, candidates, autoVersionState) {
     return verification.handleKick(entry, reasonText, spawnBot, DONUTSMP_VERSION);

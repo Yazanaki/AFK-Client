@@ -34,23 +34,25 @@ function isVerificationDisconnect(reason, connectedSince) {
 function isVerificationKick(reasonText) {
   if (!reasonText) return false;
   const r = reasonText.toLowerCase();
+  // ONLY DonutSMP's genuine account-verification prompt — the one shown when a
+  // login must be confirmed via the DonutSMP Discord bot (typically a first
+  // login from a new IP). Keep this TIGHT and specific to that message.
+  //
+  // This matcher used to also include broad terms — "donutsmp", "invalid
+  // sequence", "security check", bare "socketclosed" and bare "verification" —
+  // which swallowed essentially EVERY kick into a silent verification reconnect.
+  // That hid the real kick reason from the logs and skipped the user's "your bot
+  // was kicked" DM entirely. Anything that is NOT this specific prompt must fall
+  // through (return false) so botmanager surfaces the reason and notifies the
+  // user. In particular an "invalid sequence" kick is a real kick, NOT
+  // verification, and must be reported.
   return (
-    // socketclosed / pre-login disconnects
-    r.includes("socketclosed") ||
-    // generic verification language
-    r.includes("verification") ||
-    r.includes("please verify") ||
-    r.includes("security check") ||
-    // DonutSMP's actual kick messages (observed in logs)
     r.includes("unauthorized login") ||
-    r.includes("blocked it") ||
     r.includes("confirm it via") ||
     r.includes("discord dms") ||
     r.includes("direct messages enabled") ||
-    r.includes("donutsmp") ||
-    // Paper rejects connections with bad packet sequence numbers during the
-    // auth/login window; treat it as transient and retry like other verification kicks.
-    r.includes("invalid sequence")
+    r.includes("please verify") ||
+    r.includes("verify your account")
   );
 }
 
@@ -78,6 +80,13 @@ function scheduleVerificationRetry(entry, spawnBot, phase, version) {
 
 function handleKick(entry, reasonText, spawnBot, version) {
   const r = (reasonText || "").toLowerCase();
+
+  // Always surface the raw server-provided kick reason on stdout so it is never
+  // hidden by classification below. (botmanager also logs it via console.warn /
+  // stderr; this stdout copy is what shows up in the normal `pm2 logs` stream.)
+  console.log(
+    `[DonutSmpProfile] 🦵 [${entry.minecraftUser}] Kicked — server reason: ${reasonText || "(none provided)"}`
+  );
 
   // "Already online" — wait for the ghost session to clear, then retry.
   if (r.includes("already online")) {
