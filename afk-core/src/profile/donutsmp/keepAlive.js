@@ -5,11 +5,13 @@
 // so the bot is never dropped for inactivity:
 //   • TCP SO_KEEPALIVE      — surfaces a dead socket cleanly (ECONNRESET, not a
 //                             mid-write EPIPE).
-//   • Minecraft keep_alive  — we run with keepAlive:false, so we echo it ourselves.
-//   • play-state ping → pong — DonutSMP's transaction probe.
-//
-// All writes use origWrite (the pre-movement-suppression write) so they are
-// never dropped by the movement proxy.
+//   • Minecraft keep_alive  — we run with keepAlive:false, so we echo it ourselves
+//                             (via origWrite, to bypass the movement proxy).
+//   • play-state ping       — DonutSMP's transaction probe. We do NOT pong it
+//                             ourselves: mineflayer auto-pongs every ping, and a
+//                             second manual pong is a duplicate the anti-cheat
+//                             rejects as "Invalid sequence". We only watch pings
+//                             for liveness.
 
 const { KEEP_ALIVE_DEBUG } = require("./movement");
 
@@ -86,14 +88,19 @@ function installKeepAlive(bot, origWrite) {
   });
 
   bot._client.on("ping", (packet) => {
+    // Track liveness ONLY — do not send a pong here.
+    //
+    // mineflayer's game.js auto-responds to every `ping` with a `pong`
+    // unconditionally (it is NOT gated by the keepAlive:false option — that flag
+    // only disables minecraft-protocol's keep_alive auto-echo, which is why we
+    // still echo keep_alive manually above). Sending our own pong on top means
+    // the server receives TWO pongs for every ping — a duplicate the DonutSMP
+    // transaction anti-cheat rejects as "Invalid sequence". It accumulates and
+    // kicks the bot after ~30-60 min. This duplicate pong was the root cause of
+    // the periodic "Invalid sequence" kicks.
     markAlive();
-    try {
-      origWrite("pong", { id: packet.id });
-      if (KEEP_ALIVE_DEBUG) {
-        console.log(`[donut-pkt] 🏓 ping id=${packet.id} → pong sent`);
-      }
-    } catch (err) {
-      console.warn(`[DonutSmpProfile] ⚠️ Could not send pong:`, err.message);
+    if (KEEP_ALIVE_DEBUG) {
+      console.log(`[donut-pkt] 🏓 ping id=${packet.id} (mineflayer auto-pongs)`);
     }
   });
 
