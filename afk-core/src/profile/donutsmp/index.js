@@ -2,6 +2,7 @@
 "use strict";
 
 // DonutSMP profile — orchestrates the self-contained behaviors in this folder:
+//   diagnostics.js   — forensic packet ring buffer, dumped on every disconnect
 //   movement.js      — freeze movement (anti-detection)
 //   keepAlive.js     — keep_alive echo + ping/pong + TCP keepalive
 //   antiAfk.js       — periodic head turn (anti-AFK-kick)
@@ -14,6 +15,7 @@ const { installKeepAlive } = require("./keepAlive");
 const antiAfk = require("./antiAfk");
 const verification = require("./verification");
 const { attachHunger } = require("./hunger");
+const diagnostics = require("./diagnostics");
 
 const DONUTSMP_VERSION = "1.21.11";
 
@@ -28,6 +30,10 @@ class DonutSmpProfile extends BaseProfile {
   }
 
   onBotCreated(bot, entry, botId, spawnBot) {
+    // Install diagnostics FIRST so it wraps the raw client write before movement
+    // suppression rebinds it — that way every actually-sent packet is captured.
+    diagnostics.installDiagnostics(bot, entry);
+
     const origWrite = installMovementSuppression(bot);
     entry._donutOrigWrite = origWrite;
 
@@ -56,14 +62,17 @@ class DonutSmpProfile extends BaseProfile {
   }
 
   onKick(bot, entry, botId, reasonText, spawnBot, autoMode, candidates, autoVersionState) {
+    diagnostics.dump(entry, reasonText);
     return verification.handleKick(entry, reasonText, spawnBot, DONUTSMP_VERSION);
   }
 
   onError(bot, entry, botId, err, spawnBot) {
+    diagnostics.dump(entry, err && err.message ? `error: ${err.message}` : "error");
     return verification.handleError(entry, err, spawnBot, DONUTSMP_VERSION);
   }
 
   onEnd(bot, entry, botId, reason, spawnBot) {
+    diagnostics.dump(entry, reason);
     return verification.handleEnd(entry, reason, spawnBot, DONUTSMP_VERSION);
   }
 
