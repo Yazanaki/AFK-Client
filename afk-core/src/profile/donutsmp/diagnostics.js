@@ -60,7 +60,7 @@ const NOISE = new Set([
 // Outbound action packets we always keep the most-recent of, with full params.
 const TRACK_OUT = [
   "use_item", "block_dig", "block_place", "block_place_old",
-  "held_item_slot", "arm_animation", "look", "position_look",
+  "held_item_slot", "arm_animation", "entity_action", "look", "position_look",
   "position", "flying", // expected "never (suppressed)" — confirms the freeze
 ];
 
