@@ -35,6 +35,8 @@
 // per-packet console spam still stays behind DONUTSMP_DEBUG=forensic elsewhere.
 // Only the disconnect dump prints here, so steady-state log noise is unchanged.
 
+const { BLOCKED } = require("./movement"); // which movement packets are suppressed
+
 const RAW_RING_SIZE = 60; // last-N of EVERYTHING — the instant-of-kick picture
 const SIGNAL_RING_SIZE = 90; // last-N of interesting-only — spans minutes
 const SEQ_LOG_SIZE = 16; // last-N sequenced (use_item/block) sends
@@ -170,8 +172,7 @@ function installDiagnostics(bot, entry) {
     L.push("  ── last outbound ACTION packets (most-recent of each) ──");
     for (const name of TRACK_OUT) {
       const e = lastOut[name];
-      const label = name === "position" || name === "flying"
-        ? `${name} (suppressed)` : name;
+      const label = BLOCKED.has(name) ? `${name} (suppressed)` : name;
       L.push(`    ${label.padEnd(22)} ${age(e && e.t)}${e && e.brief ? "  " + e.brief : ""}`);
     }
 

@@ -1,40 +1,49 @@
 // afk-core/src/profile/donutsmp/movement.js
 "use strict";
 
-// DonutSMP anti-detection: freeze the bot by dropping outgoing position/flying
-// packets entirely. DonutSMP tolerates a perfectly still client; sending
-// movement is what its checks dislike.
+// DonutSMP movement policy — block the packets that carry the player's POSITION
+// (`position`, `position_look`) so the bot never transmits a coordinate, but
+// ALLOW the position-less standing heartbeat (`flying`, just onGround) and
+// rotation (`look`). The bot stands still on its own (it never sets a control
+// state), so this keeps it pinned in place while presenting the normal per-tick
+// "I'm here, on the ground" cadence that every real client sends.
 //
-// We intentionally do NOT block "look" — mineflayer's bot.look() builds the
-// correct 1.21.2+ packet (with movementFlags). Sending a raw "look" via
-// origWrite would crash with a "SizeOf error for undefined" on 1.21.2+.
+// ── WHY `flying` IS NO LONGER BLOCKED (forensic evidence, two full dumps) ─────
+// Two "Invalid sequence" kicks were captured end-to-end. They ruled out every
+// earlier theory outright:
+//   • mineflayer 4.37.1 is live and the use_item aim is corrected — yet it kicks
+//   • the bot NEVER ate in the kicking session (use_item: never; food stayed
+//     20/20 the whole 44 min) — so eating / sequenced packets are NOT required;
+//     the "only kicks while hunger drains" correlation was a red herring
+//   • ping:pong stayed strictly 1:1 — the duplicate-pong path is clean
+// What BOTH dumps share: the kick lands ~130ms after an anti-AFK `look` nudge,
+// and for the minutes before it the bot had sent ZERO movement packets because
+// the old policy also blocked `flying`. A real client never goes silent and then
+// emits a lone rotation; that movement-silent-then-isolated-look pattern is the
+// only remaining anomaly. Restoring the `flying` heartbeat embeds the nudge in a
+// normal movement-packet stream. Diagnostics stay armed to confirm.
 //
-// ── use_item AIM CORRECTION (the real "Invalid sequence"-while-eating fix) ───
-// On 1.21.3+ the `use_item` packet carries the player's aim (`rotation: vec2f`,
-// notchian degrees) so the server can validate where you were looking when you
-// used the item. mineflayer hardcoded that rotation to { x: 0, y: 0 } on every
-// activateItem() until the fix in PR #3840 (shipped in mineflayer 4.37.1).
-// 1.21.11 support landed in 4.35.0, so a bot on 4.35.0 / 4.36.0 / 4.37.0 talks
-// 1.21.11 *and* still sends the bogus { 0, 0 } aim.
+// We do NOT block "look": mineflayer's bot.look() builds the correct 1.21.2+
+// packet (with movementFlags); sending a raw "look" via origWrite would crash
+// with a "SizeOf error for undefined" on 1.21.2+. With the flying heartbeat
+// keeping mineflayer's last-sent position synced every tick, a look nudge
+// serializes as a pure `look` (no position), so blocking `position_look` never
+// suppresses a nudge.
 //
-// `use_item` is the ONLY sequenced packet that is emitted exclusively while
-// eating, which is exactly why the kick only ever appears in hunger-draining
-// worlds: every eat reports an aim of (south, level) that contradicts the bot's
-// real facing (its spawn yaw plus the anti-AFK nudges, sent via real `look`
-// packets). DonutSMP's anti-cheat accumulates that per-eat inconsistency and
-// kicks after a few eats — matching the "~1h, scales with starting hunger"
-// symptom (starting hunger just delays the first eat).
-//
-// Fix, here at the single outgoing-packet chokepoint so it is independent of the
-// installed mineflayer version: rewrite use_item's rotation to the bot's actual
-// notchian yaw/pitch (same convention mineflayer uses for movement/look, so the
-// aim now agrees with what the server already tracks). bot.activateItem() still
-// owns the `sequence` counter; we only correct the one bogus field in flight.
+// ── use_item AIM CORRECTION (kept; harmless, version-independent) ─────────────
+// On 1.21.3+ the `use_item` packet carries the player's aim (`rotation: vec2f`).
+// mineflayer hardcoded it to { x: 0, y: 0 } until 4.37.1 (PR #3840). We rewrite
+// it to the bot's real notchian yaw/pitch at this outgoing-packet chokepoint so
+// the correction holds on any installed mineflayer version. The forensic dumps
+// proved this is NOT the kick's cause, but a correct aim is still the right thing
+// to send whenever the bot does eat, so the correction stays.
 
 const KEEP_ALIVE_DEBUG =
   String(process.env.DONUTSMP_DEBUG || "minimal").toLowerCase() === "forensic";
 
-const BLOCKED = new Set(["position", "flying"]);
+// Block only position-bearing movement packets; let `flying` (onGround heartbeat)
+// and `look` (rotation) through. See the header note for the forensic rationale.
+const BLOCKED = new Set(["position", "position_look"]);
 
 // mineflayer's lib/conversions.js: toNotchianYaw = toDegrees(PI - yaw),
 // toNotchianPitch = toDegrees(-pitch). Inlined so this stays self-contained.
