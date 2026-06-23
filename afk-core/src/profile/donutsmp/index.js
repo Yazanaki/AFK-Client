@@ -47,7 +47,7 @@ class DonutSmpProfile extends BaseProfile {
     });
 
     console.log(
-      `[DonutSmpProfile] ✅ Handlers attached — movement block + manual keep-alive + ping/pong + anti-AFK + TCP keepalive + hunger active`
+      `[DonutSmpProfile] ✅ Handlers attached — movement block + manual keep-alive + ping/pong + idle-client mode (no anti-AFK actions) + TCP keepalive + hunger active`
     );
   }
 
