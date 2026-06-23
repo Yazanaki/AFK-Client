@@ -4,68 +4,83 @@
 // DonutSMP anti-AFK-kick — a small periodic action so the server never marks the
 // bot as idle. Timers are keyed by botId so multiple bots don't interfere.
 //
-// ── WHY THIS NO LONGER USES bot.look() ───────────────────────────────────────
-// Four "Invalid sequence" kicks were captured end-to-end. The ONLY thing
-// correlated with every one was the anti-AFK head turn: the kick landed
-// 130-138ms after a `look` nudge, 4 times out of 4, after ~10 nudges / ~40 min.
-// Everything else was ruled out (no eating, ping:pong 1:1, keep-alive clean,
-// mineflayer 4.37.1 with the aim fix). So we stop sending `look` packets for
-// anti-AFK entirely and use a non-rotation action instead.
+// ── DESIGN: non-look + deliberately NON-metronomic ───────────────────────────
+// Two hard constraints from the forensic history:
+//   1. The anti-AFK head turn (`look`) was correlated with all four "Invalid
+//      sequence" kicks, so we send NO `look` packets here.
+//   2. A high-frequency, perfectly-timed packet stream is a botting signature —
+//      a ~20/s `flying` flood got an account BANNED. So this stays LOW frequency
+//      (one action every few minutes) AND randomized, so there is no fixed
+//      pattern to fingerprint: random interval, random action, random duration.
 //
-// We pulse SNEAK (setControlState -> `entity_action` start/stop sneaking): it is
-// discrete player input the server counts as activity, it does not touch the
-// movement/rotation packet stream that was correlated with the kick, and it is
-// fully reversible. The bot is frozen in place (position/position_look are
-// suppressed), so sneaking never actually moves it.
+// Action pool (both are ordinary human input, stateless, and touch neither the
+// movement/look stream nor the held item, so they can't interfere with eating):
+//   • SNEAK pulse   — setControlState -> entity_action start/stop sneaking
+//   • ARM swing     — swingArm -> arm_animation
+// The bot is frozen in place (position/position_look suppressed), so sneaking
+// never actually moves it.
 
-const ANTI_AFK_MIN_MS = 3 * 60 * 1000;
-const ANTI_AFK_MAX_MS = 6 * 60 * 1000;
-const ANTI_AFK_HOLD_MS = 1500; // hold sneak this long, then release
+const ANTI_AFK_MIN_MS   = 150 * 1000; // 2.5 min — low end of the random interval
+const ANTI_AFK_MAX_MS   = 390 * 1000; // 6.5 min — high end
+const SNEAK_HOLD_MIN_MS = 350;        // randomized crouch duration
+const SNEAK_HOLD_MAX_MS = 1900;
 
-const _timers = new Map();
+const _state = new Map(); // botId -> { timer, releaseTimer, bot }
+
+const rand = (a, b) => a + Math.random() * (b - a);
 
 function schedule(botId, entry, bot) {
   cancel(botId);
-
-  const delayMs =
-    ANTI_AFK_MIN_MS + Math.floor(Math.random() * (ANTI_AFK_MAX_MS - ANTI_AFK_MIN_MS));
-
-  const timerId = setTimeout(() => {
-    _timers.delete(botId);
-    pulse(botId, entry, bot);
-  }, delayMs);
-
-  _timers.set(botId, timerId);
+  const delayMs = rand(ANTI_AFK_MIN_MS, ANTI_AFK_MAX_MS);
+  const timer = setTimeout(() => pulse(botId, entry, bot), delayMs);
+  _state.set(botId, { timer, releaseTimer: null, bot });
 }
 
 function pulse(botId, entry, bot) {
   if (entry.status !== "online") return;
   if (!bot || bot._client?.ended) return;
 
-  try {
-    bot.setControlState("sneak", true);
-    console.log(`[DonutSmpProfile] 🧎 [${entry.minecraftUser}] Anti-AFK sneak pulse`);
+  // Pick a random action so there's no fixed per-pulse signature.
+  const action = Math.random() < 0.5 ? "sneak" : "swing";
 
-    setTimeout(() => {
-      if (!bot || bot._client?.ended) return;
-      try { bot.setControlState("sneak", false); } catch (_) {}
-      if (entry.status !== "online") return;
-      schedule(botId, entry, bot);
-    }, ANTI_AFK_HOLD_MS);
+  try {
+    if (action === "swing") {
+      bot.swingArm("right");
+      console.log(`[DonutSmpProfile] 👋 [${entry.minecraftUser}] Anti-AFK swing`);
+      schedule(botId, entry, bot); // stateless, no hold — reschedule now
+      return;
+    }
+
+    // sneak: crouch for a randomized hold, then release and reschedule.
+    bot.setControlState("sneak", true);
+    const holdMs = Math.round(rand(SNEAK_HOLD_MIN_MS, SNEAK_HOLD_MAX_MS));
+    console.log(`[DonutSmpProfile] 🧎 [${entry.minecraftUser}] Anti-AFK sneak (${holdMs}ms)`);
+
+    const releaseTimer = setTimeout(() => {
+      if (bot && !bot._client?.ended) {
+        try { bot.setControlState("sneak", false); } catch (_) {}
+      }
+      if (entry.status === "online") schedule(botId, entry, bot);
+    }, holdMs);
+
+    _state.set(botId, { timer: null, releaseTimer, bot });
   } catch (err) {
-    console.warn(`[DonutSmpProfile] ⚠️ [${entry.minecraftUser}] Anti-AFK sneak failed:`, err.message);
-    // Make sure sneak isn't left stuck on, and never orphan the loop.
+    console.warn(`[DonutSmpProfile] ⚠️ [${entry.minecraftUser}] Anti-AFK action failed:`, err.message);
     try { bot.setControlState("sneak", false); } catch (_) {}
-    schedule(botId, entry, bot);
+    schedule(botId, entry, bot); // never orphan the loop
   }
 }
 
 function cancel(botId) {
-  const timerId = _timers.get(botId);
-  if (timerId != null) {
-    clearTimeout(timerId);
-    _timers.delete(botId);
+  const st = _state.get(botId);
+  if (!st) return;
+  if (st.timer) clearTimeout(st.timer);
+  if (st.releaseTimer) clearTimeout(st.releaseTimer);
+  // Make sure we never leave the bot stuck crouching.
+  if (st.bot && !st.bot._client?.ended) {
+    try { st.bot.setControlState("sneak", false); } catch (_) {}
   }
+  _state.delete(botId);
 }
 
 module.exports = { schedule, cancel };
