@@ -4,18 +4,23 @@
 // DonutSMP auto-eat — minimal and defensible.
 //
 // Eat with a SINGLE use_item via bot.activateItem(). mineflayer builds the
-// correct { hand, sequence, rotation } packet for the negotiated protocol and
-// advances its own monotonic block-interaction sequence counter. We never send
-// a release (deactivateItem -> block_dig sequence:0): that backward jump in the
-// sequence is itself rejected as "invalid sequence", and real eating completes
-// server-side after the food's use duration anyway (mineflayer clears
-// bot.usingHeldItem on its own via entity_status / heldItemChanged, no packet).
+// { hand, sequence, rotation } packet and advances its own monotonic
+// block-interaction sequence counter. We never send a release (deactivateItem
+// -> block_dig sequence:0): that backward jump in the sequence is itself
+// rejected as "invalid sequence", and real eating completes server-side after
+// the food's use duration anyway (mineflayer clears bot.usingHeldItem on its own
+// via entity_status / heldItemChanged, no packet).
 //
-// NOTE: this is intentionally the plain baseline. An earlier experiment sent
-// per-tick "movement rhythm" during the eat to try to dodge a DonutSMP "invalid
-// sequence" kick; it was speculative and unverified, so it's been removed.
-// Diagnose the real kick reason first (it's now logged in verification.js) before
-// layering behaviour on top of the eat.
+// THE ACTUAL "Invalid sequence"-while-eating ROOT CAUSE lives in the use_item
+// *rotation*, not its sequence: mineflayer ≤4.37.0 hardcodes the eat aim to
+// { x: 0, y: 0 } (fixed upstream in 4.37.1 / PR #3840), but 1.21.11 support
+// shipped back in 4.35.0 — so the deployed bot can speak 1.21.11 while still
+// sending a bogus aim on every eat. DonutSMP validates that aim against the
+// bot's real facing and kicks once enough mismatches pile up. The correction is
+// applied centrally in movement.js (the outgoing-packet proxy), so it holds on
+// any mineflayer version; see the long comment there. Don't re-litigate the
+// sequence/pong/movement-rhythm theories — those were all tried and did not fix
+// this.
 
 // Safe food items to auto-eat. Dangerous items (pufferfish, spider_eye,
 // rotten_flesh, poisonous_potato) are intentionally excluded.
@@ -48,7 +53,9 @@ function attachHunger(bot, entry) {
   async function tryEat() {
     if (isEating || Date.now() < eatCooldownUntil) return;
     if (!isCurrent()) return;
-    if (!bot.entity) return; // activateItem() reads bot.entity.yaw/pitch
+    // Need a spawned entity so the use_item aim correction (movement.js) has a
+    // real yaw/pitch to send instead of mineflayer's hardcoded { 0, 0 }.
+    if (!bot.entity) return;
     if (bot.food >= EAT_THRESHOLD) return;
 
     const foodItem = bot.inventory.items().find(

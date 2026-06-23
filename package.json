@@ -6,11 +6,11 @@
     "scripts": {
       "start": "node server.js",
       "dev": "node --watch server.js",
-      "test": "node test/use_item_eat.test.js"
+      "test": "node test/use_item_eat.test.js && node test/use_item_aim.test.js"
     },
     "dependencies": {
       "dotenv": "^16.4.5",
       "express": "^4.18.3",
-      "mineflayer": "^4.27.0"
+      "mineflayer": "^4.37.1"
     }
   }
