@@ -154,6 +154,18 @@ function installDiagnostics(bot, entry) {
 
   const startedAt = Date.now();
 
+  // Positive online-uptime heartbeat (log only — sends ZERO packets). Lets you
+  // see at a glance whether the bot has survived past the ~43 min mark where the
+  // "Invalid sequence" kick always landed. Clears itself on disconnect.
+  const HEARTBEAT_MS = 10 * 60 * 1000;
+  const heartbeat = setInterval(() => {
+    if (!bot._client || bot._client.ended) { clearInterval(heartbeat); return; }
+    const upMin = Math.floor((Date.now() - startedAt) / 60000);
+    console.log(`[donutsmp/diagnostics] 💚 ${entry.minecraftUser} online ${upMin}m — no kick yet`);
+  }, HEARTBEAT_MS);
+  if (heartbeat.unref) heartbeat.unref();
+  bot._client.once("end", () => clearInterval(heartbeat));
+
   entry._donutDump = (reason) => {
     const now = Date.now();
     const age = (t) => (t ? `${String(now - t).padStart(6)}ms ago` : "       never");
