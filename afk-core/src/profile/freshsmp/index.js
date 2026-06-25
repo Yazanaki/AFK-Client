@@ -2,16 +2,18 @@
 "use strict";
 
 // FreshSMP profile — orchestrates the self-contained behaviors in this folder:
+//   diagnostics.js forensic packet/state capture, dumped on every disconnect
 //   settings.js   client_information field-filler + config-state movement drop
 //   lifecycle.js  always-on lifecycle logger + ring-buffer dump on kick
 //   keepAlive.js  keep_alive echo + ping logging + cookie_response
 //   movement.js   per-tick flying keepalive (anti-detection)
 //   transfer.js   re-send settings in PLAY after a Velocity transfer
-//   antiAfk.js    periodic head turn (anti-AFK-kick)
+//   antiAfk.js    idle-client mode (no anti-AFK actions sent)
 //   gamemode.js   /queue gamemode flow
 //   hunger.js     auto-eat (attached here once added)
 
 const { BaseProfile } = require("../BaseProfile");
+const diagnostics = require("./diagnostics");
 const { installSettingsInterceptor, sendClientSettings } = require("./settings");
 const { installLifecycleLogger } = require("./lifecycle");
 const { installKeepAlive } = require("./keepAlive");
@@ -38,9 +40,14 @@ class FreshSmpProfile extends BaseProfile {
     // Ring buffer shared by settings.js (writer) and lifecycle.js (dumper).
     entry._recentOut = [];
 
-    // The settings interceptor MUST be installed first — it wraps bot._client.write
-    // and returns the original (bound) write that the keepalive/movement handlers
-    // use to bypass the patch.
+    // Diagnostics FIRST — it wraps the RAW bot._client.write before the settings
+    // interceptor rebinds it, so every actually-sent packet (settings-patched and
+    // origWrite-bypassed alike) is captured for the forensic dump.
+    diagnostics.installDiagnostics(bot, entry);
+
+    // The settings interceptor wraps bot._client.write (capturing the diagnostics
+    // writer as its origWrite) and returns that original (bound) write, which the
+    // keepalive/movement handlers use to bypass the settings patch.
     const origWrite = installSettingsInterceptor(bot, entry);
     installLifecycleLogger(bot, entry);
     installKeepAlive(bot, entry, origWrite);
@@ -48,8 +55,7 @@ class FreshSmpProfile extends BaseProfile {
     installTransferHandler(bot, entry);
     attachHunger(bot, entry);
 
-    // Start anti-AFK after login (valid entity yaw/pitch; not during the
-    // pre-login security screen).
+    // Idle-client mode: no anti-AFK actions. schedule() is a documented no-op.
     bot.once("login", () => {
       antiAfk.schedule(botId, entry, bot);
     });
@@ -77,6 +83,7 @@ class FreshSmpProfile extends BaseProfile {
   onSpawn(bot, entry, botId) {}
 
   onKick(bot, entry, botId, reasonText, spawnBot, autoMode, candidates, autoVersionState) {
+    diagnostics.dump(entry, reasonText);
     const lower = (reasonText || "").toLowerCase();
     if (lower.includes("server error") || lower.includes("internal error")) {
       console.warn(
@@ -89,8 +96,14 @@ class FreshSmpProfile extends BaseProfile {
     return false;
   }
 
-  onError(bot, entry, botId, err, spawnBot) { return false; }
-  onEnd(bot, entry, botId, reason, spawnBot) { return false; }
+  onError(bot, entry, botId, err, spawnBot) {
+    diagnostics.dump(entry, err && err.message ? `error: ${err.message}` : "error");
+    return false;
+  }
+  onEnd(bot, entry, botId, reason, spawnBot) {
+    diagnostics.dump(entry, reason);
+    return false;
+  }
 
   onCleanup(botId) {
     gamemode.cancelPendingGamemode(botId);
