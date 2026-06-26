@@ -26,6 +26,8 @@
 // across the transfer. If it ever turns out to be a real `transfer`-packet
 // reconnect (new socket), this capture would need re-installing on reconnect.
 
+const { chatText } = require("./lifecycle"); // flatten chat NBT for kick-notice match
+
 const RAW_RING_SIZE = 80;    // last-N of EVERYTHING — the instant-of-kick picture
 const SIGNAL_RING_SIZE = 90; // last-N of interesting-only — spans minutes
 const SEQ_LOG_SIZE = 16;     // last-N sequenced (use_item/block) sends
@@ -55,6 +57,7 @@ const TRACK_OUT = [
   "held_item_slot", "arm_animation", "entity_action",
   "look", "position_look", "position", "flying",
   "settings", "client_information", "chat", "chat_command", "chat_message",
+  "message_acknowledgement", // British spelling — the signed-chat ack `count`
 ];
 
 // Inbound packets whose timing matters for the transfer / sequence diagnosis.
@@ -105,6 +108,9 @@ function installDiagnostics(bot, entry) {
   const lastIn = {};       // name -> {t, brief}
   let inCount = 0;
   let outCount = 0;
+  let lastQueueAt = 0;       // last outbound /queue — distinguishes a wanted transfer from a kick
+  let lastAutoDumpAt = 0;    // throttle for in-session auto-dumps (proxy-absorbed kick loop)
+  const AUTO_DUMP_THROTTLE_MS = 8000;
 
   const pushRing = (ring, item, max) => {
     ring.push(item);
@@ -119,6 +125,7 @@ function installDiagnostics(bot, entry) {
     }
     if (dir === "OUT") {
       outCount++;
+      if (name.startsWith("chat_command") || name.startsWith("chat_message")) lastQueueAt = t;
       if (TRACK_OUT.includes(name)) lastOut[name] = { t, brief: safeStr(data) };
       if (SEQUENCED.has(name) && data) {
         pushRing(seqLog, { t, name, sequence: data.sequence, rotation: data.rotation }, SEQ_LOG_SIZE);
@@ -154,8 +161,44 @@ function installDiagnostics(bot, entry) {
     try { record("IN", meta.name, data); } catch {}
   });
 
+  // ── In-session auto-dump (throttled). The "Invalid sequence" kick is absorbed by
+  // the Velocity proxy (survival→limbo→survival on the SAME socket), so mineflayer
+  // never emits "kicked" and the onKick→dump path never fires. These triggers fire
+  // the dump from inside the live session instead. The rings are NOT cleared on a
+  // transfer, so a late trigger still holds the full pre-kick history.
+  const maybeAutoDump = (reason) => {
+    const now = Date.now();
+    if (now - lastAutoDumpAt < AUTO_DUMP_THROTTLE_MS) return; // one dump per kick cycle
+    lastAutoDumpAt = now;
+    if (typeof entry._freshDump === "function") {
+      try { entry._freshDump(reason); } catch (_) {}
+    }
+  };
+
+  // Primary trigger: the proxy's "You were kicked from X: <reason>" notice arrives
+  // as system_chat (NOT player_chat), so a player typing "ban"/"kicked" can't
+  // false-trigger it.
+  const KICK_NOTICE = /you were kicked from|invalid sequence|you were removed/i;
+  bot._client.on("system_chat", (p) => {
+    try {
+      const txt = chatText(p && p.content).replace(/§./g, "").replace(/\s+/g, " ").trim();
+      if (txt && KICK_NOTICE.test(txt)) {
+        maybeAutoDump("BACKEND KICK (proxy-absorbed): " + txt.slice(0, 300));
+      }
+    } catch (_) {}
+  });
+
   // ── State / transfer timeline.
-  bot._client.on("state", (s) => { try { recordEvent(`STATE→${s}`, null); } catch {} });
+  bot._client.on("state", (s) => {
+    try { recordEvent(`STATE→${s}`, null); } catch {}
+    // Backstop: an unexpected drop to configuration that we did NOT cause with a
+    // /queue (no chat_command in the last ~3s) is a kick — catches kicks that
+    // arrive with no system_chat reason. The legitimate initial /queue switch is
+    // excluded by the lastQueueAt guard.
+    if (s === "configuration" && Date.now() - lastQueueAt > 3000) {
+      maybeAutoDump("forced transfer to configuration (no /queue sent)");
+    }
+  });
   bot._client.on("transfer", (p) => {
     try { recordEvent("TRANSFER", { host: p?.host, port: p?.port }); } catch {}
   });

@@ -8,6 +8,7 @@
 //   keepAlive.js  keep_alive echo + ping logging + cookie_response
 //   movement.js   per-tick flying keepalive (anti-detection)
 //   transfer.js   re-send settings in PLAY after a Velocity transfer
+//   chat.js       reset signed-chat acknowledgment state on transfer
 //   antiAfk.js    idle-client mode (no anti-AFK actions sent)
 //   gamemode.js   /queue gamemode flow
 //   hunger.js     auto-eat (attached here once added)
@@ -19,6 +20,7 @@ const { installLifecycleLogger } = require("./lifecycle");
 const { installKeepAlive } = require("./keepAlive");
 const { installPerTickMovement } = require("./movement");
 const { installTransferHandler } = require("./transfer");
+const { installChatSessionReset } = require("./chat");
 const antiAfk = require("./antiAfk");
 const gamemode = require("./gamemode");
 const { attachHunger } = require("./hunger");
@@ -53,6 +55,7 @@ class FreshSmpProfile extends BaseProfile {
     installKeepAlive(bot, entry, origWrite);
     installPerTickMovement(bot, entry, origWrite);
     installTransferHandler(bot, entry);
+    installChatSessionReset(bot, entry);
     attachHunger(bot, entry);
 
     // Idle-client mode: no anti-AFK actions. schedule() is a documented no-op.
