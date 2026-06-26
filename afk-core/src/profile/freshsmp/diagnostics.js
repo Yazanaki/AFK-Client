@@ -111,6 +111,7 @@ function installDiagnostics(bot, entry) {
   let lastQueueAt = 0;       // last outbound /queue — distinguishes a wanted transfer from a kick
   let lastAutoDumpAt = 0;    // throttle for in-session auto-dumps (proxy-absorbed kick loop)
   let prevState = null;      // previous connection state — backstop only fires on play→config
+  let teleportInCount = 0;   // inbound position/teleport packets — anti-cheat setback magnitude
   const AUTO_DUMP_THROTTLE_MS = 8000;
 
   const pushRing = (ring, item, max) => {
@@ -133,6 +134,7 @@ function installDiagnostics(bot, entry) {
       }
     } else {
       inCount++;
+      if (name === "position") teleportInCount++; // server teleport / setback
       if (TRACK_IN.includes(name)) lastIn[name] = { t, brief: safeStr(data) };
     }
   };
@@ -234,6 +236,22 @@ function installDiagnostics(bot, entry) {
     L.push(`  reason      : ${reasonText}`);
     L.push(`  state now   : ${bot._client && bot._client.state}`);
     L.push(`  session     : ~${uptimeS}s online, ${outCount} sent / ${inCount} received`);
+    // Physics / position state — is mineflayer tracking ground+position, and how hard
+    // is the server setting us back? A floating onGround=false or a teleport flood is
+    // the anti-cheat "setback" signature behind the residual "Invalid sequence".
+    try {
+      const e = bot.entity;
+      const pos = e && e.position
+        ? `(${e.position.x.toFixed(1)}, ${e.position.y.toFixed(1)}, ${e.position.z.toFixed(1)})`
+        : "(none)";
+      L.push(
+        `  physics     : pos=${pos} onGround=${e ? e.onGround : "?"} ` +
+        `yaw=${e && typeof e.yaw === "number" ? e.yaw.toFixed(2) : "?"} ` +
+        `pitch=${e && typeof e.pitch === "number" ? e.pitch.toFixed(2) : "?"} ` +
+        `gameMode=${bot.game ? bot.game.gameMode : "?"} ` +
+        `serverTeleports=${teleportInCount}`
+      );
+    } catch (_) { L.push(`  physics     : (unavailable)`); }
 
     // The transfer timeline — the pivotal signal for the post-/queue kick.
     L.push("  ── connection STATE / transfer timeline (newest last) ──");
