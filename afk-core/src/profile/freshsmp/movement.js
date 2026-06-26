@@ -1,63 +1,30 @@
 // afk-core/src/profile/freshsmp/movement.js
 "use strict";
 
-// FreshSMP per-tick movement keepalive (anti-detection). FreshSMP's survival
-// backend floods ~20/s `ping` transactions and expects a movement packet EVERY
-// tick, like a real client. mineflayer optimizes idle movement away (~1/s), and a
-// forensic dump proved that under-sending movement is what gets us kicked with
-// "Invalid sequence" ~19s after joining. We replicate a stationary vanilla client
-// by sending `flying` (status-only) every 50ms while in PLAY, via origWrite so it
-// isn't dropped by the config-state movement filter and doesn't spam the ring.
+// FreshSMP per-tick movement keepalive — NEUTRALIZED (no-op).
 //
-// Two bugs the dump exposed in the previous version (both fixed here):
-//   1. Wrong packet shape. It sent { flags: { onGround, hasHorizontalCollision } }
-//      — missing the top-level `onGround` — which throws "SizeOf error" every tick
-//      (swallowed), so NOTHING was ever sent. The shape mineflayer itself emits on
-//      this server (protocol 774) is { onGround, flags: { onGround } }; use that.
-//   2. Self-kill on transfer. It called clearInterval whenever bot._client.ended
-//      was truthy; a transient `ended` during a Velocity transfer killed the
-//      keepalive permanently so it never resumed on the new backend. Now the tick
-//      only SKIPS when not ready and is cleared solely on the bot "end" event, and
-//      we re-arm (idempotently) on every entry into PLAY.
+// History: this module flooded `flying` every 50ms (~20/s) on the theory that
+// FreshSMP's backend wants a movement packet every tick like a real client. Once
+// the keepalive was actually fixed to send (it had been throwing for ages), a
+// forensic dump disproved that theory decisively: at 20/s the bot was "Invalid
+// sequence"-kicked almost INSTANTLY (<1s, ~166ms on the Hub) on EVERY backend —
+// versus the ~19s it lasted with NO artificial movement.
+//
+// The premise was simply wrong. A real vanilla client does NOT send a movement
+// packet every tick while standing still — when fully idle it sends a position
+// only ~once per second (the 20-tick "send anyway" rule). mineflayer already
+// replicates that idle cadence, so flooding 20/s is grossly UNNATURAL and the
+// anti-cheat flags it immediately. Sending nothing extra is strictly better.
+//
+// We therefore send NO artificial movement and let mineflayer's own physics emit
+// the natural ~1/s idle position + the mandatory teleport_confirm responses.
+// (Kept as a no-op so index.js's installPerTickMovement(...) call stays valid.)
 
-function installPerTickMovement(bot, entry, origWrite) {
-  let timer = null;
-  let warned = false;
-
-  const stop = () => {
-    if (timer) { clearInterval(timer); timer = null; }
-  };
-
-  const start = () => {
-    if (timer) return; // idempotent — one interval, re-armed safely
-    timer = setInterval(() => {
-      const c = bot && bot._client;
-      if (!c || c.ended || c.state !== "play") return; // skip, never self-kill
-      try {
-        const og = (bot.entity && typeof bot.entity.onGround === "boolean")
-          ? bot.entity.onGround : true;
-        origWrite("flying", { onGround: og, flags: { onGround: og } });
-      } catch (err) {
-        if (!warned) {
-          warned = true;
-          console.warn(
-            `[FreshSmpProfile] ⚠️ [${entry.minecraftUser}] per-tick flying failed:`,
-            err.message
-          );
-        }
-        // swallow — the next tick retries; a throw must not stop the keepalive
-      }
-    }, 50);
-    if (timer.unref) timer.unref();
-    entry._tickMoveTimer = timer;
-  };
-
-  // Re-arm on every transition into PLAY (survives Velocity transfers), and start
-  // now in case we're already there.
-  bot._client.on("state", (s) => { if (s === "play") start(); });
-  start();
-
-  bot.on("end", stop);
+function installPerTickMovement(bot, entry /*, origWrite */) {
+  console.log(
+    `[FreshSmpProfile] 🟰 [${entry.minecraftUser}] per-tick movement disabled ` +
+    `(20/s flying caused instant "Invalid sequence"; idling like a real away client)`
+  );
 }
 
 module.exports = { installPerTickMovement };
