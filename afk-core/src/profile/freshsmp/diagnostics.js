@@ -110,6 +110,7 @@ function installDiagnostics(bot, entry) {
   let outCount = 0;
   let lastQueueAt = 0;       // last outbound /queue — distinguishes a wanted transfer from a kick
   let lastAutoDumpAt = 0;    // throttle for in-session auto-dumps (proxy-absorbed kick loop)
+  let prevState = null;      // previous connection state — backstop only fires on play→config
   const AUTO_DUMP_THROTTLE_MS = 8000;
 
   const pushRing = (ring, item, max) => {
@@ -191,13 +192,15 @@ function installDiagnostics(bot, entry) {
   // ── State / transfer timeline.
   bot._client.on("state", (s) => {
     try { recordEvent(`STATE→${s}`, null); } catch {}
-    // Backstop: an unexpected drop to configuration that we did NOT cause with a
-    // /queue (no chat_command in the last ~3s) is a kick — catches kicks that
-    // arrive with no system_chat reason. The legitimate initial /queue switch is
-    // excluded by the lastQueueAt guard.
-    if (s === "configuration" && Date.now() - lastQueueAt > 3000) {
+    // Backstop: an unexpected drop from PLAY back to configuration that we did NOT
+    // cause with a /queue (no chat_command in the last ~3s) is a kick — catches
+    // kicks that arrive with no system_chat reason. Requiring prev==="play"
+    // excludes the initial login→configuration handshake; the lastQueueAt guard
+    // excludes the legitimate /queue backend switch.
+    if (prevState === "play" && s === "configuration" && Date.now() - lastQueueAt > 3000) {
       maybeAutoDump("forced transfer to configuration (no /queue sent)");
     }
+    prevState = s;
   });
   bot._client.on("transfer", (p) => {
     try { recordEvent("TRANSFER", { host: p?.host, port: p?.port }); } catch {}

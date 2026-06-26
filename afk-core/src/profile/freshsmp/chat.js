@@ -23,6 +23,14 @@
 // session from a clean count. Every field touch is guarded so this is safe across
 // minecraft-protocol versions (field shapes differ between 1.19.1–1.19.2 and
 // 1.19.3+).
+//
+// NOTE (forensic finding): on FreshSMP specifically this reset is a no-op — the
+// server delivers ALL chat (even player messages) as `system_chat`, never signed
+// `player_chat`, so `_lastSeenMessages.pending` never grows (dumps show
+// "pending was 0" and `message_acknowledgement` is never sent). FreshSMP's
+// "Invalid sequence" kick is caused by under-sent per-tick movement (see
+// movement.js), NOT chat acks. This stays as a correctness safety-net for any
+// backend that DOES use signed player_chat across a transfer.
 
 function installChatSessionReset(bot, entry) {
   bot._client.on("state", (newState) => {
