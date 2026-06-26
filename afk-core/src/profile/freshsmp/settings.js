@@ -51,6 +51,15 @@ function sendClientSettings(client) {
 function installSettingsInterceptor(bot, entry) {
   const _origWrite = bot._client.write.bind(bot._client);
 
+  // Track whether we've reached PLAY at least once. mineflayer's config handshake
+  // — and our own onLogin settings timer if it fires mid-transfer — can emit
+  // client_information during a transfer's configuration phase, and FreshSMP's
+  // Pipeline proxy SERVER-ERRORs on that. The INITIAL login config is fine (the
+  // server expects client_information there), so we only suppress it once we've
+  // been in PLAY, i.e. on a subsequent backend transfer.
+  let _everInPlay = false;
+  bot._client.on("state", (s) => { if (s === "play") _everInPlay = true; });
+
   bot._client.write = function freshSmpSettingsPatch(name, params) {
     // Drop movement packets during CONFIGURATION state (Velocity transfer).
     if (
@@ -60,6 +69,16 @@ function installSettingsInterceptor(bot, entry) {
       if (FRESHSMP_DEBUG) {
         console.log(`[fresh-pkt] → DROPPED ${name} (movement during configuration state)`);
       }
+      return;
+    }
+
+    // Drop client_information during a TRANSFER's configuration phase — Pipeline
+    // SERVER-ERRORs on it (see _everInPlay note above). transfer.js re-sends the
+    // settings once back in PLAY, so the server still gets them.
+    if (name === "client_information" && bot._client.state === "configuration" && _everInPlay) {
+      console.log(
+        `[FreshSmpProfile] 🚫 [${entry.minecraftUser}] dropped client_information during transfer config (avoids SERVER ERROR)`
+      );
       return;
     }
 

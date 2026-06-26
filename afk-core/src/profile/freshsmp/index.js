@@ -67,8 +67,11 @@ class FreshSmpProfile extends BaseProfile {
   onLogin(bot, entry, botId, spawnBot, callbacks) {
     // Send client settings for the initial login (belt-and-suspenders — the
     // write interceptor already guarantees mineflayer's auto-send is correct).
+    // Only in PLAY: if a transfer is mid-flight at this 1s mark, sending
+    // client_information during configuration SERVER-ERRORs us (transfer.js
+    // re-sends settings once back in play).
     setTimeout(() => {
-      if (!bot || bot._client?.ended) return;
+      if (!bot || bot._client?.ended || bot._client.state !== "play") return;
       try {
         sendClientSettings(bot._client);
         console.log(`[FreshSmpProfile] ✅ [${entry.minecraftUser}] Client settings sent (initial login)`);
