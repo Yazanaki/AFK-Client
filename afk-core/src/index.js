@@ -17,14 +17,16 @@
 const { DefaultProfile }  = require("./profile/DefaultProfile");
 const { DonutSmpProfile } = require("./profile/donutsmp");
 const { FreshSmpProfile } = require("./profile/freshsmp");
+const { ElementalMcProfile } = require("./profile/elementalmc");
 const { HypixelProfile }  = require("./profile/HypixelProfile");
 
 // ─── Profile singletons ────────────────────────────────────────────────────────
 const profiles = {
-  default:  new DefaultProfile(),
-  donutsmp: new DonutSmpProfile(),
-  freshsmp: new FreshSmpProfile(),
-  hypixel:  new HypixelProfile(),
+  default:    new DefaultProfile(),
+  donutsmp:   new DonutSmpProfile(),
+  freshsmp:   new FreshSmpProfile(),
+  elementalmc: new ElementalMcProfile(),
+  hypixel:    new HypixelProfile(),
 };
 
 // ─── Host pattern → profile mapping ───────────────────────────────────────────
@@ -34,8 +36,12 @@ const HOST_PROFILES = [
     profileId: "donutsmp",
   },
   {
-    patterns:  ["freshsmp.net", "freshsmp", "elementalmc.live", "play.elementalmc.live"],
+    patterns:  ["freshsmp.net", "freshsmp.fun", "freshsmp"],
     profileId: "freshsmp",
+  },
+  {
+    patterns:  ["elementalmc.live", "play.elementalmc.live", "elementalmc"],
+    profileId: "elementalmc",
   },
   {
     patterns:  ["hypixel.net", "hypixel"],

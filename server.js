@@ -174,11 +174,12 @@ app.post("/start", (req, res) => {
       }
     : null;
 
-  // Determine whether this server uses a FreshSMP profile so we know
-  // whether to set up the spawned-notification callback.
+  // Determine whether this server uses a gamemode/queue profile (FreshSMP or the
+  // FreshSMP-seeded ElementalMC) so we know whether to set up the spawned-
+  // notification callback that drives the gamemode selector.
   const serverProfile = getProfileForHost(serverAddress.trim());
   const onFreshSmpSpawned =
-    serverProfile.id === "freshsmp"
+    ["freshsmp", "elementalmc"].includes(serverProfile.id)
       ? (firedBotId) => {
           pendingFreshSmpSpawned.set(firedBotId, {
             discordId:    discordId.trim(),
