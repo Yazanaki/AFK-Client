@@ -490,6 +490,9 @@ function startBot(
     donutSmpReadyAt: 0,
     freshSmpGamemode: null,
     freshSmpQueueSent: false,
+    // Consecutive transient-kick reconnect attempts (FreshSMP / ElementalMC
+    // "invalid sequence" handling — see profile/*/reconnect.js).
+    profileReconnectRetries: 0,
   };
 
   activeBots.set(botId, entry);
@@ -952,13 +955,18 @@ function _entryToStatus(entry) {
 // ============================================================
 
 function sendFreshSmpQueueCommand(botId, gamemode) {
-  const { profiles } = require("./afk-core/src/index");
-  const freshSmpProfile = profiles.freshsmp;
+  // Route to the bot's own profile — FreshSMP and ElementalMC each keep their own
+  // pending-gamemode map, so we must target the profile the bot actually runs.
+  const entry = activeBots.get(botId);
+  const profile =
+    entry && entry.profile && typeof entry.profile.selectGamemode === "function"
+      ? entry.profile
+      : require("./afk-core/src/index").profiles.freshsmp;
 
-  const selectionResult = freshSmpProfile.selectGamemode(botId, gamemode);
+  const selectionResult = profile.selectGamemode(botId, gamemode);
   if (selectionResult.success) return selectionResult;
 
-  return freshSmpProfile.sendQueueCommand(activeBots, botId, gamemode);
+  return profile.sendQueueCommand(activeBots, botId, gamemode);
 }
 
 module.exports = {

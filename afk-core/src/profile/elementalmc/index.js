@@ -1,7 +1,7 @@
-// afk-core/src/profile/freshsmp/index.js
+// afk-core/src/profile/elementalmc/index.js
 "use strict";
 
-// FreshSMP profile — orchestrates the self-contained behaviors in this folder:
+// ElementalMC profile — orchestrates the self-contained behaviors in this folder:
 //   settings.js   client_information field-filler + config-state movement drop
 //   lifecycle.js  always-on lifecycle logger + ring-buffer dump on kick
 //   keepAlive.js  keep_alive echo + ping logging + cookie_response
@@ -22,11 +22,11 @@ const gamemode = require("./gamemode");
 const { attachHunger } = require("./hunger");
 const { isTransientKick, scheduleReconnect } = require("./reconnect");
 
-const FRESHSMP_VERSION = "1.21.11";
+const ELEMENTALMC_VERSION = "1.21.11";
 
-class FreshSmpProfile extends BaseProfile {
+class ElementalMcProfile extends BaseProfile {
   constructor() {
-    super("freshsmp", FRESHSMP_VERSION);
+    super("elementalmc", ELEMENTALMC_VERSION);
   }
 
   // We handle keep_alive ourselves (keepAlive.js), so disable the built-in
@@ -63,15 +63,15 @@ class FreshSmpProfile extends BaseProfile {
       if (!bot || bot._client?.ended) return;
       try {
         sendClientSettings(bot._client);
-        console.log(`[FreshSmpProfile] ✅ [${entry.minecraftUser}] Client settings sent (initial login)`);
+        console.log(`[ElementalMcProfile] ✅ [${entry.minecraftUser}] Client settings sent (initial login)`);
       } catch (err) {
-        console.warn(`[FreshSmpProfile] ⚠️ [${entry.minecraftUser}] Could not send client settings:`, err.message);
+        console.warn(`[ElementalMcProfile] ⚠️ [${entry.minecraftUser}] Could not send client settings:`, err.message);
       }
     }, 1000);
 
     const { onFreshSmpSpawned } = callbacks || {};
     gamemode.runGamemodeFlow(botId, entry, bot, onFreshSmpSpawned).catch((err) => {
-      console.warn(`[FreshSmpProfile] ⚠️ runGamemodeFlow error for ${entry.minecraftUser}:`, err.message);
+      console.warn(`[ElementalMcProfile] ⚠️ runGamemodeFlow error for ${entry.minecraftUser}:`, err.message);
     });
   }
 
@@ -86,7 +86,7 @@ class FreshSmpProfile extends BaseProfile {
     // portable half of the DonutSMP fix (see reconnect.js).
     if (isTransientKick(reasonText, entry?.connectedSince)) {
       console.log(
-        `[FreshSmpProfile] 🔁 [${entry?.minecraftUser}] Transient kick detected — scheduling reconnect`
+        `[ElementalMcProfile] 🔁 [${entry?.minecraftUser}] Transient kick detected — scheduling reconnect`
       );
       scheduleReconnect(entry, spawnBot, entry.version);
       return true;
@@ -94,11 +94,11 @@ class FreshSmpProfile extends BaseProfile {
 
     if (lower.includes("server error") || lower.includes("internal error")) {
       console.warn(
-        `[FreshSmpProfile] ⚠️ [${entry?.minecraftUser}] SERVER ERROR kick — ` +
-        `FreshSMP rejected the connection (malformed or missing packet). ` +
+        `[ElementalMcProfile] ⚠️ [${entry?.minecraftUser}] SERVER ERROR kick — ` +
+        `ElementalMC rejected the connection (malformed or missing packet). ` +
         `Raw reason: ${reasonText}`
       );
-      if (entry) entry.errorCategory = "freshsmp_server_error";
+      if (entry) entry.errorCategory = "elementalmc_server_error";
     }
     return false;
   }
@@ -111,7 +111,7 @@ class FreshSmpProfile extends BaseProfile {
     antiAfk.cancel(botId);
   }
 
-  // ── Public gamemode API (called by botmanager via profiles.freshsmp) ────────
+  // ── Public gamemode API (called by botmanager via profiles.elementalmc) ────────
   selectGamemode(botId, gm) {
     return gamemode.selectGamemode(botId, gm);
   }
@@ -122,7 +122,7 @@ class FreshSmpProfile extends BaseProfile {
 }
 
 module.exports = {
-  FreshSmpProfile,
-  FRESHSMP_VERSION,
-  FRESHSMP_GAMEMODES: gamemode.FRESHSMP_GAMEMODES,
+  ElementalMcProfile,
+  ELEMENTALMC_VERSION,
+  ELEMENTALMC_GAMEMODES: gamemode.ELEMENTALMC_GAMEMODES,
 };
