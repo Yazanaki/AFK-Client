@@ -16,6 +16,7 @@ const antiAfk = require("./antiAfk");
 const verification = require("./verification");
 const { attachHunger } = require("./hunger");
 const diagnostics = require("./diagnostics");
+const reconnect = require("../reconnect");
 
 const DONUTSMP_VERSION = "1.21.11";
 
@@ -68,16 +69,30 @@ class DonutSmpProfile extends BaseProfile {
 
   onError(bot, entry, botId, err, spawnBot) {
     diagnostics.dump(entry, err && err.message ? `error: ${err.message}` : "error");
-    return verification.handleError(entry, err, spawnBot, DONUTSMP_VERSION);
+    // Pre-login socket resets are handled as verification retries; anything it
+    // doesn't claim that is still a silent TCP drop is auto-recovered here.
+    if (verification.handleError(entry, err, spawnBot, DONUTSMP_VERSION)) return true;
+    if (reconnect.isSilentDropError(err)) {
+      return reconnect.scheduleSilentReconnect(entry, botId, spawnBot, DONUTSMP_VERSION, err.code);
+    }
+    return false;
   }
 
   onEnd(bot, entry, botId, reason, spawnBot) {
     diagnostics.dump(entry, reason);
-    return verification.handleEnd(entry, reason, spawnBot, DONUTSMP_VERSION);
+    // Verification-window socketClosed → verification retry (existing behaviour).
+    if (verification.handleEnd(entry, reason, spawnBot, DONUTSMP_VERSION)) return true;
+    // Any other silent socket close (mid-session) → auto-reconnect with backoff,
+    // independent of AUTO_RECONNECT, so the bot doesn't drop offline for good.
+    if (reconnect.isSilentDropReason(reason)) {
+      return reconnect.scheduleSilentReconnect(entry, botId, spawnBot, DONUTSMP_VERSION, reason);
+    }
+    return false;
   }
 
   onCleanup(botId) {
     antiAfk.cancel(botId);
+    reconnect.cancel(botId);
   }
 }
 

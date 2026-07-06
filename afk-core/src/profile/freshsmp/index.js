@@ -24,6 +24,7 @@ const { installChatSessionReset } = require("./chat");
 const antiAfk = require("./antiAfk");
 const gamemode = require("./gamemode");
 const { attachHunger } = require("./hunger");
+const reconnect = require("../reconnect");
 
 const FRESHSMP_VERSION = "1.21.11";
 
@@ -104,16 +105,27 @@ class FreshSmpProfile extends BaseProfile {
 
   onError(bot, entry, botId, err, spawnBot) {
     diagnostics.dump(entry, err && err.message ? `error: ${err.message}` : "error");
+    // A raw TCP drop (ECONNRESET / EPIPE / ETIMEDOUT) carries no kick reason —
+    // auto-recover it with backoff instead of letting the bot go offline.
+    if (reconnect.isSilentDropError(err)) {
+      return reconnect.scheduleSilentReconnect(entry, botId, spawnBot, FRESHSMP_VERSION, err.code);
+    }
     return false;
   }
   onEnd(bot, entry, botId, reason, spawnBot) {
     diagnostics.dump(entry, reason);
+    // socketClosed / keepalive_timeout = the server or its Velocity proxy closed
+    // the connection silently. Reconnect automatically with backoff.
+    if (reconnect.isSilentDropReason(reason)) {
+      return reconnect.scheduleSilentReconnect(entry, botId, spawnBot, FRESHSMP_VERSION, reason);
+    }
     return false;
   }
 
   onCleanup(botId) {
     gamemode.cancelPendingGamemode(botId);
     antiAfk.cancel(botId);
+    reconnect.cancel(botId);
   }
 
   // ── Public gamemode API (called by botmanager via profiles.freshsmp) ────────
