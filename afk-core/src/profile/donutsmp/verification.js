@@ -9,7 +9,6 @@
 const MAX_VERIFICATION_RETRIES = 10;
 const VERIFICATION_RECONNECT_DELAY_MS = 5000;
 const VERIFICATION_WINDOW_SECONDS = 60;
-const MID_SESSION_RECONNECT_DELAY_MS = 8000;
 // "Already online" means our previous session is still alive server-side. Wait
 // longer so the server can time out the ghost before we reconnect (typically
 // 10-30s for Minecraft servers).
@@ -130,18 +129,10 @@ function handleError(entry, err, spawnBot, version) {
     return true;
   }
 
-  // Mid-session drop — reconnect silently without bumping the verification
-  // counter and without letting botmanager record this as an ended bot.
-  const uptimeSec = entry.connectedSince
-    ? Math.floor((Date.now() - entry.connectedSince) / 1000)
-    : null;
-  console.log(
-    `[DonutSmpProfile] 🔄 [${entry.minecraftUser}] Mid-session ${err.code} after ` +
-    `${uptimeSec !== null ? uptimeSec + "s online" : "pre-login"} — reconnecting silently in ${MID_SESSION_RECONNECT_DELAY_MS}ms`
-  );
-  entry.status = "reconnecting";
-  setTimeout(() => spawnBot(version), MID_SESSION_RECONNECT_DELAY_MS);
-  return true;
+  // Mid-session drop — not a verification issue. Leave it to the shared
+  // silent-reconnect policy (index.js), which backs off across repeated drops
+  // regardless of whether they arrive as ECONNRESET or a bare socketClosed.
+  return false;
 }
 
 function handleEnd(entry, reason, spawnBot, version) {
